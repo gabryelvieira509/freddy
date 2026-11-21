@@ -1,0 +1,543 @@
+#include <Servo.h>
+
+// =====================================================================
+//  ANIMATRONIC EYES - smooth (eased) motion, Freddy-style animations
+// =====================================================================
+
+// ---------------- PINS ----------------
+const int LEFT_EYE_PIN  = 10;
+const int RIGHT_EYE_PIN = 13;
+const int LEFT_LID_PIN  = 11;
+const int RIGHT_LID_PIN = 12;
+
+// ---------------- CALIBRATION ----------------
+const int EYE_CENTER = 85;
+const int EYE_MIN    = 60;
+const int EYE_MAX    = 110;
+
+const int LID_L_OPEN = 95;
+const int LID_R_OPEN = 110;
+
+// Closed angles - adjustable live over Serial: + / - (left), ] / [ (right)
+int lidLClosed = 170;
+int lidRClosed = 60;
+
+// Lid levels in percent (0 = wide open, 100 = fully closed)
+const float LID_WIDE   = 0;
+const float LID_REST   = 10;    // slightly heavy resting lids (Freddy look)
+const float LID_CLOSED = 100;
+
+// Blink tuning (raise the times if the lids look out of sync)
+const int BLINK_CLOSE_MS = 110;
+const int BLINK_HOLD_MS  = 80;
+const int BLINK_OPEN_MS  = 180;
+const int SETTLE_MS      = 150;   // wait after a full close so servos arrive
+
+// If cross-eyed looks "wall-eyed", flip to -1. Same idea for the lazy eye.
+const int CROSS_DIR = 1;
+const int LAZY_DIR  = 1;
+
+// ---------------- EASING ----------------
+const byte EASE_LINEAR = 0;
+const byte EASE_IN     = 1;   // starts slow, ends fast
+const byte EASE_OUT    = 2;   // starts fast, ends slow
+const byte EASE_INOUT  = 3;   // smooth both ends
+
+// ---------------- SERVOS / STATE ----------------
+Servo leftEye, rightEye, leftLid, rightLid;
+
+float eL = EYE_CENTER, eR = EYE_CENTER;   // eye angles (degrees)
+float lL = LID_REST,   lR = LID_REST;     // lid levels (percent)
+
+bool idleMode   = true;
+bool freddyMode = false;
+unsigned long nextBlinkAt = 0;
+
+// ---------------- LOW-LEVEL ----------------
+
+// Same mapping as Servo.write(), but with fractional-degree precision
+int degToUs(float deg) {
+  return 544 + (int)(deg * (2400.0f - 544.0f) / 180.0f + 0.5f);
+}
+
+float lidAngleL(float pct) { return LID_L_OPEN + (lidLClosed - LID_L_OPEN) * pct / 100.0f; }
+float lidAngleR(float pct) { return LID_R_OPEN + (lidRClosed - LID_R_OPEN) * pct / 100.0f; }
+
+void writeEyes() {
+  leftEye.writeMicroseconds(degToUs(eL));
+  rightEye.writeMicroseconds(degToUs(eR));
+}
+
+void writeLids() {
+  leftLid.writeMicroseconds(degToUs(lidAngleL(lL)));
+  rightLid.writeMicroseconds(degToUs(lidAngleR(lR)));
+}
+
+float applyEase(float t, byte ease) {
+  switch (ease) {
+    case EASE_IN:    return t * t;
+    case EASE_OUT:   return 1.0f - (1.0f - t) * (1.0f - t);
+    case EASE_INOUT: return t * t * (3.0f - 2.0f * t);
+    default:         return t;
+  }
+}
+
+// Moves eyes AND lids at the same time to their targets over `ms`
+void animate(float tel, float ter, float tll, float tlr, int ms, byte ease) {
+  tel = constrain(tel, EYE_MIN, EYE_MAX);
+  ter = constrain(ter, EYE_MIN, EYE_MAX);
+  tll = constrain(tll, 0, 100);
+  tlr = constrain(tlr, 0, 100);
+
+  float sel = eL, ser = eR, sll = lL, slr = lR;
+  unsigned long t0 = millis();
+
+  while (true) {
+    float t = (ms <= 0) ? 1.0f : (float)(millis() - t0) / (float)ms;
+    if (t > 1.0f) t = 1.0f;
+    float k = applyEase(t, ease);
+
+    eL = sel + (tel - sel) * k;
+    eR = ser + (ter - ser) * k;
+    lL = sll + (tll - sll) * k;
+    lR = slr + (tlr - slr) * k;
+    writeEyes();
+    writeLids();
+
+    if (t >= 1.0f) break;
+    delay(8);
+  }
+}
+
+// Convenience wrappers
+void eyesTo(float a, int ms, byte e)           { animate(a, a, lL, lR, ms, e); }
+void lidsTo(float p, int ms, byte e)           { animate(eL, eR, p, p, ms, e); }
+void both(float a, float p, int ms, byte e)    { animate(a, a, p, p, ms, e); }
+
+// Instant jumps (used for glitches and scares)
+void snapEyes(float l, float r) {
+  eL = constrain(l, EYE_MIN, EYE_MAX);
+  eR = constrain(r, EYE_MIN, EYE_MAX);
+  writeEyes();
+}
+void snapLids(float p) {
+  lL = lR = constrain(p, 0, 100);
+  writeLids();
+}
+
+// Waits, but returns false early if a Serial command arrives
+bool hold(unsigned long ms) {
+  unsigned long start = millis();
+  while (millis() - start < ms) {
+    if (Serial.available()) return false;
+    delay(5);
+  }
+  return true;
+}
+
+// Jerky, mechanical movement: small steps with pauses (animatronic feel)
+void stiffTo(float target, float stepDeg, int moveMs, int pauseMs) {
+  target = constrain(target, EYE_MIN, EYE_MAX);
+  while (true) {
+    float d = target - eL;
+    if (d < 0.01f && d > -0.01f) break;
+    float next = (d > 0) ? eL + stepDeg : eL - stepDeg;
+    if ((d > 0 && next > target) || (d < 0 && next < target)) next = target;
+    eyesTo(next, moveMs, EASE_OUT);
+    delay(pauseMs);
+  }
+}
+
+void scheduleBlink() { nextBlinkAt = millis() + random(2000, 6000); }
+
+// ---------------- BASIC EXPRESSIONS ----------------
+
+void blink() {
+  lidsTo(LID_CLOSED, BLINK_CLOSE_MS, EASE_IN);
+  delay(BLINK_HOLD_MS);
+  lidsTo(LID_REST, BLINK_OPEN_MS, EASE_OUT);
+}
+
+void doubleBlink() {
+  blink();
+  delay(110);
+  blink();
+}
+
+void winkLeft() {
+  animate(eL, eR, LID_CLOSED, lR, 200, EASE_IN);
+  delay(450);
+  animate(eL, eR, LID_REST, lR, 250, EASE_OUT);
+}
+
+void winkRight() {
+  animate(eL, eR, lL, LID_CLOSED, 200, EASE_IN);
+  delay(450);
+  animate(eL, eR, lL, LID_REST, 250, EASE_OUT);
+}
+
+// Curious: glances around the room
+void lookAround() {
+  eyesTo(EYE_MAX - 8, 90, EASE_OUT);
+  delay(600);
+  eyesTo(EYE_MIN + 8, 140, EASE_INOUT);
+  delay(500);
+  eyesTo(EYE_MAX - 20, 80, EASE_OUT);
+  delay(300);
+  eyesTo(EYE_CENTER, 200, EASE_INOUT);
+}
+
+// Drifts off to sleep, half-wakes, drifts again, then jolts awake
+void sleepy() {
+  eyesTo(EYE_CENTER, 300, EASE_INOUT);
+  lidsTo(85, 2200, EASE_INOUT);
+  delay(500);
+  lidsTo(40, 500, EASE_OUT);
+  delay(250);
+  lidsTo(92, 900, EASE_IN);
+  delay(500);
+  lidsTo(LID_WIDE, 120, EASE_OUT);   // jolt awake
+  delay(300);
+  lidsTo(LID_REST, 300, EASE_INOUT);
+  doubleBlink();
+}
+
+void surprised() {
+  snapLids(LID_WIDE);
+  eyesTo(EYE_MIN + 5, 60, EASE_OUT);
+  delay(250);
+  eyesTo(EYE_MAX - 5, 100, EASE_INOUT);
+  delay(250);
+  eyesTo(EYE_CENTER, 120, EASE_OUT);
+  delay(400);
+  lidsTo(LID_REST, 400, EASE_INOUT);
+  blink();
+}
+
+void crossEyes() {
+  animate(EYE_CENTER + 15 * CROSS_DIR, EYE_CENTER - 15 * CROSS_DIR, lL, lR, 600, EASE_INOUT);
+  delay(1200);
+  animate(EYE_CENTER, EYE_CENTER, lL, lR, 600, EASE_INOUT);
+}
+
+void scan() {
+  eyesTo(EYE_MAX, 1200, EASE_INOUT);
+  eyesTo(EYE_MIN, 2200, EASE_INOUT);
+  eyesTo(EYE_CENTER, 1000, EASE_INOUT);
+}
+
+void shakeNo() {
+  for (int i = 0; i < 3; i++) {
+    eyesTo(EYE_CENTER + 15, 160, EASE_INOUT);
+    eyesTo(EYE_CENTER - 15, 160, EASE_INOUT);
+  }
+  eyesTo(EYE_CENTER, 160, EASE_INOUT);
+}
+
+void suspicious() {
+  eyesTo(EYE_MAX - 5, 350, EASE_INOUT);
+  lidsTo(55, 500, EASE_INOUT);
+  delay(1500);
+  lidsTo(LID_REST, 500, EASE_INOUT);
+  eyesTo(EYE_CENTER, 500, EASE_INOUT);
+}
+
+// One lid squinted, one wide, eyes to the side
+void skeptical() {
+  animate(EYE_MAX - 8, EYE_MAX - 8, 45, LID_WIDE, 450, EASE_INOUT);
+  delay(1400);
+  animate(EYE_CENTER, EYE_CENTER, LID_REST, LID_REST, 500, EASE_INOUT);
+}
+
+// Lids drop fast, fixed glare with a tiny tremor
+void angry() {
+  both(EYE_CENTER, 42, 180, EASE_OUT);
+  for (int i = 0; i < 8; i++) {
+    eyesTo(EYE_CENTER + ((i % 2) ? 1.5f : -1.5f), 60, EASE_LINEAR);
+    delay(120);
+  }
+  eyesTo(EYE_CENTER, 100, EASE_OUT);
+  delay(500);
+  lidsTo(LID_REST, 600, EASE_INOUT);
+}
+
+// ---------------- CALIBRATION HELPERS ----------------
+
+// Closes slowly and holds so you can check that BOTH lids shut completely
+void lidTest() {
+  Serial.println("lid test: closing...");
+  lidsTo(LID_CLOSED, 1500, EASE_INOUT);
+  delay(2000);
+  Serial.println("lid test: opening...");
+  lidsTo(LID_WIDE, 1500, EASE_INOUT);
+  delay(1000);
+  lidsTo(LID_REST, 500, EASE_INOUT);
+}
+
+void showLidCal() {
+  Serial.print("left closed = ");
+  Serial.print(lidLClosed);
+  Serial.print(" | right closed = ");
+  Serial.println(lidRClosed);
+  lidsTo(LID_CLOSED, 500, EASE_INOUT);
+  delay(1200);
+  lidsTo(LID_REST, 500, EASE_INOUT);
+}
+
+// ---------------- FREDDY / FNAF STYLE ----------------
+
+// Locked on you, heavy lids, no blinking (interrupted by Serial input)
+void stare(unsigned long ms) {
+  both(EYE_CENTER, LID_REST, 300, EASE_INOUT);
+  hold(ms);
+}
+
+// Slow, heavy blink
+void heavyBlink() {
+  lidsTo(LID_CLOSED, 450, EASE_INOUT);
+  delay(300);
+  lidsTo(LID_REST, 500, EASE_INOUT);
+}
+
+// Half-lidded, stiff slow turn, freeze, then SNAP back to you
+void creepyTurn() {
+  lidsTo(35, 600, EASE_INOUT);
+  stiffTo(EYE_MIN + 3, 3, 70, 90);
+  delay(1800);
+  both(EYE_CENTER, LID_WIDE, 70, EASE_OUT);   // snap
+  delay(1500);
+  lidsTo(LID_REST, 600, EASE_INOUT);
+}
+
+// Stalking: lids slowly narrow while it stares, then snap wide
+void stalk() {
+  both(EYE_CENTER, LID_REST, 300, EASE_INOUT);
+  lidsTo(28, 3500, EASE_INOUT);
+  delay(1200);
+  lidsTo(LID_WIDE, 90, EASE_OUT);
+  delay(700);
+  lidsTo(LID_REST, 500, EASE_INOUT);
+}
+
+// Electrical glitch: random twitching and lid flicker
+void glitch() {
+  int n = random(8, 14);
+  for (int i = 0; i < n; i++) {
+    snapEyes(EYE_CENTER + random(-10, 11), EYE_CENTER + random(-10, 11));
+    snapLids(random(0, 70));
+    delay(random(30, 90));
+  }
+  both(EYE_CENTER, LID_REST, 120, EASE_OUT);
+}
+
+// Faulty servo: one eye jerks on its own
+void twitch() {
+  int n = random(4, 8);
+  for (int i = 0; i < n; i++) {
+    float off = random(4, 9) * (random(2) ? 1 : -1);
+    if (random(2)) snapEyes(EYE_CENTER + off, EYE_CENTER);
+    else           snapEyes(EYE_CENTER, EYE_CENTER + off);
+    delay(random(40, 120));
+    snapEyes(EYE_CENTER, EYE_CENTER);
+    delay(random(150, 700));
+  }
+}
+
+// One eye slowly drifts off, then both correct
+void lazyEye() {
+  both(EYE_CENTER, LID_REST, 300, EASE_INOUT);
+  animate(EYE_CENTER + 18 * LAZY_DIR, EYE_CENTER, lL, lR, 2500, EASE_INOUT);
+  delay(1800);
+  animate(EYE_CENTER, EYE_CENTER, LID_REST, LID_REST, 90, EASE_OUT);
+  delay(800);
+}
+
+// Rapid half-blinks, like a nervous system
+void lidFlutter() {
+  int n = random(6, 10);
+  for (int i = 0; i < n; i++) {
+    lidsTo(random(40, 75), 50, EASE_LINEAR);
+    lidsTo(LID_REST, 50, EASE_LINEAR);
+  }
+  delay(300);
+  blink();
+}
+
+// Wide eyes, violent shaking that dies down, then dead stare
+void jumpscare() {
+  snapLids(LID_WIDE);
+  for (int amp = 25; amp >= 3; amp -= 2) {
+    snapEyes(EYE_CENTER + amp, EYE_CENTER + amp);
+    delay(35);
+    snapEyes(EYE_CENTER - amp, EYE_CENTER - amp);
+    delay(35);
+  }
+  both(EYE_CENTER, LID_WIDE, 100, EASE_OUT);
+  delay(1500);
+  lidsTo(LID_REST, 900, EASE_INOUT);
+}
+
+// Power runs out: stuttering, lids sag fully shut and stay shut
+void powerDown() {
+  eyesTo(EYE_CENTER, 300, EASE_INOUT);
+  float p = lL;
+  while (p < 100) {
+    p += random(6, 16);
+    if (p > 100) p = 100;
+    lidsTo(p, random(60, 140), EASE_OUT);
+    delay(random(80, 300));
+    if (random(4) == 0 && p < 95) {
+      lidsTo(p - 15, 60, EASE_LINEAR);
+      delay(40);
+      lidsTo(p, 60, EASE_LINEAR);
+    }
+  }
+  lidsTo(LID_CLOSED, 150, EASE_OUT);
+  delay(SETTLE_MS);
+}
+
+// Power comes back: jerky wake-up, glitch, then dead stare
+void powerUp() {
+  float p = lL;
+  while (p > LID_REST) {
+    p -= random(10, 28);
+    if (p < LID_REST) p = LID_REST;
+    lidsTo(p, random(50, 120), EASE_OUT);
+    delay(random(60, 220));
+  }
+  glitch();
+  stare(800);
+}
+
+// Camera-like stiff sweep, then locks onto you
+void watchYou() {
+  lidsTo(20, 300, EASE_INOUT);
+  stiffTo(EYE_MAX, 4, 60, 90);
+  delay(700);
+  stiffTo(EYE_MIN, 4, 60, 90);
+  delay(700);
+  stiffTo(EYE_CENTER, 4, 60, 90);
+  lidsTo(LID_REST, 300, EASE_INOUT);
+  delay(1500);
+}
+
+// Freddy idle loop: mostly staring, with rare creepy events
+void freddyStep() {
+  int roll = random(100);
+  if (roll < 30)      stare(random(2500, 6000));
+  else if (roll < 45) heavyBlink();
+  else if (roll < 57) creepyTurn();
+  else if (roll < 67) watchYou();
+  else if (roll < 75) stalk();
+  else if (roll < 83) twitch();
+  else if (roll < 88) lazyEye();
+  else if (roll < 93) lidFlutter();
+  else                glitch();
+  hold(random(500, 1500));
+}
+
+// ---------------- NORMAL IDLE (LIFE-LIKE) ----------------
+
+// Waits, blinking on schedule; returns early if a Serial command arrives
+void wait(unsigned long ms) {
+  unsigned long start = millis();
+  while (millis() - start < ms) {
+    if (Serial.available()) return;
+    if (millis() >= nextBlinkAt) {
+      blink();
+      scheduleBlink();
+    }
+    delay(5);
+  }
+}
+
+void idleStep() {
+  int roll = random(100);
+  float target = random(EYE_MIN + 5, EYE_MAX - 5);
+
+  if (roll < 55)      eyesTo(target, random(60, 110), EASE_OUT);      // quick glance
+  else if (roll < 82) eyesTo(target, random(300, 700), EASE_INOUT);   // slow drift
+  else if (roll < 90) doubleBlink();
+  else if (roll < 95) lookAround();
+  else                eyesTo(EYE_CENTER, 400, EASE_INOUT);
+  wait(random(600, 2600));
+}
+
+// ---------------- SERIAL CONTROL ----------------
+// b blink | d double blink | l wink left | r wink right | s sleepy
+// u surprised | c cross-eyed | x scan | n shake no | q suspicious
+// e skeptical | a angry | h heavy blink | k creepy turn | y stalk
+// g glitch | t twitch | m lazy eye | o lid flutter | j jumpscare
+// p power down | w power up | v watch you | z lid test
+// f freddy mode | i idle mode
+// Lid calibration: + / - = left closed angle, ] / [ = right closed angle
+
+void handleSerial() {
+  if (!Serial.available()) return;
+  char c = Serial.read();
+  switch (c) {
+    case 'b': blink();        break;
+    case 'd': doubleBlink();  break;
+    case 'l': winkLeft();     break;
+    case 'r': winkRight();    break;
+    case 's': sleepy();       break;
+    case 'u': surprised();    break;
+    case 'c': crossEyes();    break;
+    case 'x': scan();         break;
+    case 'n': shakeNo();      break;
+    case 'q': suspicious();   break;
+    case 'e': skeptical();    break;
+    case 'a': angry();        break;
+    case 'h': heavyBlink();   break;
+    case 'k': creepyTurn();   break;
+    case 'y': stalk();        break;
+    case 'g': glitch();       break;
+    case 't': twitch();       break;
+    case 'm': lazyEye();      break;
+    case 'o': lidFlutter();   break;
+    case 'j': jumpscare();    break;
+    case 'p': powerDown();    break;
+    case 'w': powerUp();      break;
+    case 'v': watchYou();     break;
+    case 'z': lidTest();      break;
+
+    case '+': lidLClosed = min(180, lidLClosed + 5); showLidCal(); break;
+    case '-': lidLClosed = max(100, lidLClosed - 5); showLidCal(); break;
+    case ']': lidRClosed = max(0, lidRClosed - 5);   showLidCal(); break;
+    case '[': lidRClosed = min(100, lidRClosed + 5); showLidCal(); break;
+
+    case 'f':
+      freddyMode = !freddyMode;
+      Serial.println(freddyMode ? "freddy mode ON" : "freddy mode OFF");
+      break;
+    case 'i':
+      idleMode = !idleMode;
+      Serial.println(idleMode ? "idle ON" : "idle OFF");
+      break;
+  }
+}
+
+// ---------------- SETUP / LOOP ----------------
+
+void setup() {
+  Serial.begin(9600);
+  randomSeed(analogRead(A0));
+
+  leftEye.attach(LEFT_EYE_PIN);
+  rightEye.attach(RIGHT_EYE_PIN);
+  leftLid.attach(LEFT_LID_PIN);
+  rightLid.attach(RIGHT_LID_PIN);
+
+  writeEyes();
+  writeLids();
+  delay(500);
+
+  scheduleBlink();
+  Serial.println("Ready: b d l r s u c x n q e a h k y g t m o j p w v z f i | lids: + - ] [");
+}
+
+void loop() {
+  handleSerial();
+  if (freddyMode)    freddyStep();
+  else if (idleMode) idleStep();
+}
