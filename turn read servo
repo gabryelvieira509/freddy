@@ -1,0 +1,144 @@
+// Left/Right turn servo - desk companion animations
+// Range: 60 (max left, robot's point of view) ... 93 (center) ... 120 (max right)
+
+#include <Servo.h>
+
+const int TURN_PIN = 8;
+const int CENTER_T = 93;
+const int LEFT_LIMIT = 60;
+const int RIGHT_LIMIT = 120;
+
+Servo T;
+int currentPos = CENTER_T;
+
+// ---------- helpers ----------
+
+int safePos(int p) {
+  return constrain(p, LEFT_LIMIT, RIGHT_LIMIT);  // never leave the safe range
+}
+
+// smooth move with ease-in/ease-out (smoothstep)
+void moveTo(int target, int durationMs) {
+  target = safePos(target);
+  int start = currentPos;
+  unsigned long t0 = millis();
+
+  while (millis() - t0 < (unsigned long)durationMs) {
+    float t = (float)(millis() - t0) / durationMs;
+    float e = t * t * (3.0 - 2.0 * t);
+    currentPos = start + (int)round((target - start) * e);
+    T.write(currentPos);
+    delay(15);
+  }
+  currentPos = target;
+  T.write(currentPos);
+}
+
+// ---------- animations ----------
+
+// tiny idle sway around center
+void idleSway(int durationMs) {
+  unsigned long t0 = millis();
+  while (millis() - t0 < (unsigned long)durationMs) {
+    float phase = 2.0 * PI * (millis() - t0) / 4000.0;
+    currentPos = safePos(CENTER_T + (int)round(3.0 * sin(phase)));
+    T.write(currentPos);
+    delay(20);
+  }
+}
+
+// looks left, then right, then back to center
+void lookAround() {
+  moveTo(70, 700);
+  delay(800);
+  moveTo(116, 1100);
+  delay(800);
+  moveTo(CENTER_T, 700);
+}
+
+// "no" head shake
+void shakeNo() {
+  for (int i = 0; i < 3; i++) {
+    moveTo(78, 260);
+    moveTo(108, 260);
+  }
+  moveTo(CENTER_T, 350);
+}
+
+// slow scan from one side to the other, like a radar
+void scan() {
+  moveTo(LEFT_LIMIT, 800);
+  delay(300);
+  moveTo(RIGHT_LIMIT, 3000);
+  delay(300);
+  moveTo(CENTER_T, 900);
+}
+
+// double take: glances away, snaps back, then looks again
+void doubleTake() {
+  moveTo(110, 500);
+  delay(300);
+  moveTo(CENTER_T, 180);
+  delay(250);
+  moveTo(114, 220);
+  delay(700);
+  moveTo(CENTER_T, 600);
+}
+
+// heard something: quick turn to one side and holds
+void heardSomething() {
+  int side = random(0, 2) ? 66 : 120;
+  moveTo(side, 220);
+  delay(1500);
+  moveTo(side == 66 ? 74 : 112, 400);  // tiny re-adjust
+  delay(900);
+  moveTo(CENTER_T, 800);
+}
+
+// excited wiggle
+void wiggle() {
+  for (int i = 0; i < 6; i++) {
+    moveTo(CENTER_T - 14, 120);
+    moveTo(CENTER_T + 14, 120);
+  }
+  moveTo(CENTER_T, 250);
+}
+
+// bored: drifts slowly to one side, gives a sigh, drifts back
+void bored() {
+  moveTo(80, 2500);
+  delay(1200);
+  moveTo(96, 1800);
+  delay(600);
+  moveTo(CENTER_T, 900);
+}
+
+// ---------- main ----------
+
+void setup() {
+  Serial.begin(9600);
+  randomSeed(analogRead(A0));  // A0 left unconnected = random noise
+
+  T.attach(TURN_PIN);
+  T.write(CENTER_T);
+  currentPos = CENTER_T;
+  delay(800);
+
+  Serial.println("Turn servo animations ready");
+}
+
+void loop() {
+  idleSway(random(3000, 7000));  // idle between animations
+
+  int pick = random(0, 8);
+  switch (pick) {
+    case 0: Serial.println("lookAround");     lookAround();     break;
+    case 1: Serial.println("shakeNo");        shakeNo();        break;
+    case 2: Serial.println("scan");           scan();           break;
+    case 3: Serial.println("doubleTake");     doubleTake();     break;
+    case 4: Serial.println("heardSomething"); heardSomething(); break;
+    case 5: Serial.println("wiggle");         wiggle();         break;
+    case 6: Serial.println("bored");          bored();          break;
+    case 7: Serial.println("lookAround");     lookAround();     break;
+  }
+}
