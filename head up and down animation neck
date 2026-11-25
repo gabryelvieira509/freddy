@@ -1,0 +1,136 @@
+// Up/Down head servo - desk companion animations
+// Range: 75 (head up) ... 93 (center) ... 110 (head down)
+
+#include <Servo.h>
+
+const int UD_PIN = 9;
+const int CENTER_UD = 93;
+const int UP_LIMIT = 75;
+const int DOWN_LIMIT = 110;
+
+Servo UDServo;
+int currentPos = CENTER_UD;
+
+// ---------- helpers ----------
+
+int safePos(int p) {
+  return constrain(p, UP_LIMIT, DOWN_LIMIT);  // never leave the safe range
+}
+
+// smooth move with ease-in/ease-out (smoothstep)
+void moveTo(int target, int durationMs) {
+  target = safePos(target);
+  int start = currentPos;
+  unsigned long t0 = millis();
+
+  while (millis() - t0 < (unsigned long)durationMs) {
+    float t = (float)(millis() - t0) / durationMs;
+    float e = t * t * (3.0 - 2.0 * t);
+    currentPos = start + (int)round((target - start) * e);
+    UDServo.write(currentPos);
+    delay(15);
+  }
+  currentPos = target;
+  UDServo.write(currentPos);
+}
+
+// ---------- animations ----------
+
+// slow "breathing" around center
+void breathe(int durationMs) {
+  unsigned long t0 = millis();
+  while (millis() - t0 < (unsigned long)durationMs) {
+    float phase = 2.0 * PI * (millis() - t0) / 2500.0;
+    currentPos = safePos(CENTER_UD + (int)round(2.5 * sin(phase)));
+    UDServo.write(currentPos);
+    delay(20);
+  }
+}
+
+// "yes" nod
+void nodYes() {
+  for (int i = 0; i < 3; i++) {
+    moveTo(106, 280);
+    moveTo(86, 280);
+  }
+  moveTo(CENTER_UD, 350);
+}
+
+// curious: slowly lifts the head, holds, then a quick little dip
+void curious() {
+  moveTo(78, 1200);
+  delay(900);
+  moveTo(100, 220);
+  delay(150);
+  moveTo(80, 300);
+  delay(600);
+  moveTo(CENTER_UD, 700);
+}
+
+// excited: fast bounces
+void excited() {
+  for (int i = 0; i < 6; i++) {
+    moveTo(80, 130);
+    moveTo(103, 130);
+  }
+  moveTo(CENTER_UD, 300);
+}
+
+// sleepy: head droops, jerks awake, droops again, finally gives in
+void sleepy() {
+  moveTo(104, 1800);
+  delay(400);
+  moveTo(92, 150);        // wakes up!
+  delay(500);
+  moveTo(108, 2200);
+  delay(1200);
+  moveTo(CENTER_UD, 900); // slowly wakes for real
+}
+
+// stretch: reaches up high, then relaxes down
+void stretch() {
+  moveTo(UP_LIMIT, 1500);
+  delay(1000);
+  moveTo(DOWN_LIMIT - 4, 500);
+  delay(300);
+  moveTo(CENTER_UD, 700);
+}
+
+// shy: peeks up, ducks down, peeks again
+void shy() {
+  moveTo(86, 600);
+  delay(300);
+  moveTo(DOWN_LIMIT, 250);
+  delay(900);
+  moveTo(84, 800);
+  delay(500);
+  moveTo(CENTER_UD, 600);
+}
+
+// ---------- main ----------
+
+void setup() {
+  Serial.begin(9600);
+  randomSeed(analogRead(A0));  // A0 left unconnected = random noise
+
+  UDServo.attach(UD_PIN);
+  UDServo.write(CENTER_UD);
+  currentPos = CENTER_UD;
+  delay(800);
+
+  Serial.println("Servo animations ready");
+}
+
+void loop() {
+  breathe(random(3000, 7000));  // idle between animations
+
+  int pick = random(0, 6);
+  switch (pick) {
+    case 0: Serial.println("nodYes");  nodYes();  break;
+    case 1: Serial.println("curious"); curious(); break;
+    case 2: Serial.println("excited"); excited(); break;
+    case 3: Serial.println("sleepy");  sleepy();  break;
+    case 4: Serial.println("stretch"); stretch(); break;
+    case 5: Serial.println("shy");     shy();     break;
+  }
+}
