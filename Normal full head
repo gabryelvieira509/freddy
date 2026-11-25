@@ -1,0 +1,1251 @@
+#include <Servo.h>
+
+// =====================================================================
+//  ANIMATRONIC HEAD - eyes + lids + head up/down + head turn
+//  Smooth (eased) motion, companion animations, Freddy-style animations
+// =====================================================================
+
+// ---------------- PINS ----------------
+const int LEFT_EYE_PIN  = 10;
+const int RIGHT_EYE_PIN = 13;
+const int LEFT_LID_PIN  = 11;
+const int RIGHT_LID_PIN = 12;
+const int HEAD_UD_PIN   = 9;    // head up / down
+const int HEAD_T_PIN    = 8;    // head turn left / right
+
+// ---------------- CALIBRATION: EYES ----------------
+const int EYE_CENTER = 85;
+const int EYE_MIN    = 60;
+const int EYE_MAX    = 110;
+
+const int LID_L_OPEN = 95;
+const int LID_R_OPEN = 110;
+
+// Closed angles - adjustable live over Serial: + / - (left), ] / [ (right)
+int lidLClosed = 170;
+int lidRClosed = 60;
+
+// Lid levels in percent (0 = wide open, 100 = fully closed)
+const float LID_WIDE   = 0;
+const float LID_REST   = 10;    // slightly heavy resting lids (Freddy look)
+const float LID_CLOSED = 100;
+
+// ---------------- CALIBRATION: HEAD ----------------
+// Up/down: bigger = lower. Turn: 60 = max left (robot's point of view)
+const int UD_CENTER = 93;
+const int UD_UP     = 75;
+const int UD_DOWN   = 110;
+
+const int T_CENTER  = 93;
+const int T_LEFT    = 60;
+const int T_RIGHT   = 120;
+
+// If the head turns the OPPOSITE way from where the eyes look, flip to -1
+const int HEAD_FOLLOW_DIR = 1;
+
+// Blink tuning (raise the times if the lids look out of sync)
+const int BLINK_CLOSE_MS = 110;
+const int BLINK_HOLD_MS  = 80;
+const int BLINK_OPEN_MS  = 180;
+const int SETTLE_MS      = 150;   // wait after a full close so servos arrive
+
+// If cross-eyed looks "wall-eyed", flip to -1. Same idea for the lazy eye.
+const int CROSS_DIR = 1;
+const int LAZY_DIR  = 1;
+
+// ---------------- EASING ----------------
+const byte EASE_LINEAR = 0;
+const byte EASE_IN     = 1;   // starts slow, ends fast
+const byte EASE_OUT    = 2;   // starts fast, ends slow
+const byte EASE_INOUT  = 3;   // smooth both ends
+
+// ---------------- SERVOS / STATE ----------------
+Servo leftEye, rightEye, leftLid, rightLid, headUD, headT;
+
+float eL = EYE_CENTER, eR = EYE_CENTER;   // eye angles (degrees)
+float lL = LID_REST,   lR = LID_REST;     // lid levels (percent)
+float hUD = UD_CENTER, hT = T_CENTER;     // head angles now
+float tUD = UD_CENTER, tT = T_CENTER;     // head targets (used by the next animate)
+
+bool idleMode   = true;
+bool freddyMode = false;
+unsigned long nextBlinkAt = 0;
+
+// ---------------- LOW-LEVEL ----------------
+
+// Same mapping as Servo.write(), but with fractional-degree precision
+int degToUs(float deg) {
+  return 544 + (int)(deg * (2400.0f - 544.0f) / 180.0f + 0.5f);
+}
+
+float lidAngleL(float pct) { return LID_L_OPEN + (lidLClosed - LID_L_OPEN) * pct / 100.0f; }
+float lidAngleR(float pct) { return LID_R_OPEN + (lidRClosed - LID_R_OPEN) * pct / 100.0f; }
+
+void writeEyes() {
+  leftEye.writeMicroseconds(degToUs(eL));
+  rightEye.writeMicroseconds(degToUs(eR));
+}
+
+void writeLids() {
+  leftLid.writeMicroseconds(degToUs(lidAngleL(lL)));
+  rightLid.writeMicroseconds(degToUs(lidAngleR(lR)));
+}
+
+void writeHead() {
+  headUD.writeMicroseconds(degToUs(hUD));
+  headT.writeMicroseconds(degToUs(hT));
+}
+
+float applyEase(float t, byte ease) {
+  switch (ease) {
+    case EASE_IN:    return t * t;
+    case EASE_OUT:   return 1.0f - (1.0f - t) * (1.0f - t);
+    case EASE_INOUT: return t * t * (3.0f - 2.0f * t);
+    default:         return t;
+  }
+}
+
+// Sets where the head should go. It moves during the NEXT animate() call
+// (so head, eyes and lids all travel together on the same timeline).
+void head(float ud, float t) {
+  tUD = constrain(ud, UD_UP, UD_DOWN);
+  tT  = constrain(t, T_LEFT, T_RIGHT);
+}
+
+// Moves eyes, lids AND head at the same time to their targets over `ms`
+void animate(float tel, float ter, float tll, float tlr, int ms, byte ease) {
+  tel = constrain(tel, EYE_MIN, EYE_MAX);
+  ter = constrain(ter, EYE_MIN, EYE_MAX);
+  tll = constrain(tll, 0, 100);
+  tlr = constrain(tlr, 0, 100);
+
+  float sel = eL, ser = eR, sll = lL, slr = lR;
+  float sud = hUD, st = hT;
+  unsigned long t0 = millis();
+
+  while (true) {
+    float t = (ms <= 0) ? 1.0f : (float)(millis() - t0) / (float)ms;
+    if (t > 1.0f) t = 1.0f;
+    float k = applyEase(t, ease);
+
+    eL = sel + (tel - sel) * k;
+    eR = ser + (ter - ser) * k;
+    lL = sll + (tll - sll) * k;
+    lR = slr + (tlr - slr) * k;
+    hUD = sud + (tUD - sud) * k;
+    hT  = st  + (tT  - st)  * k;
+    writeEyes();
+    writeLids();
+    writeHead();
+
+    if (t >= 1.0f) break;
+    delay(8);
+  }
+}
+
+// Convenience wrappers
+void eyesTo(float a, int ms, byte e)           { animate(a, a, lL, lR, ms, e); }
+void lidsTo(float p, int ms, byte e)           { animate(eL, eR, p, p, ms, e); }
+void both(float a, float p, int ms, byte e)    { animate(a, a, p, p, ms, e); }
+
+// Moves only the head (eyes and lids stay where they are)
+void headMove(float ud, float t, int ms) {
+  head(ud, t);
+  animate(eL, eR, lL, lR, ms, EASE_INOUT);
+}
+
+// Everything back to neutral: head centered, eyes centered, resting lids
+void goHome(int ms) {
+  head(UD_CENTER, T_CENTER);
+  animate(EYE_CENTER, EYE_CENTER, LID_REST, LID_REST, ms, EASE_INOUT);
+}
+
+// Maps an eye angle to the matching head-turn angle
+float headFromEye(float eyeAngle) {
+  float a = T_CENTER + HEAD_FOLLOW_DIR * (eyeAngle - EYE_CENTER) * 0.8f;
+  return constrain(a, T_LEFT, T_RIGHT);
+}
+
+// Eyes lead the movement, the head follows a moment later (feels alive)
+void lookTo(float eyeAngle, int eyeMs, int headMs, int udOffset) {
+  eyesTo(eyeAngle, eyeMs, EASE_OUT);
+  delay(60);
+  head(UD_CENTER + udOffset, headFromEye(eyeAngle));
+  animate(eL, eR, lL, lR, headMs, EASE_INOUT);
+}
+
+// Instant jumps (used for glitches and scares)
+void snapEyes(float l, float r) {
+  eL = constrain(l, EYE_MIN, EYE_MAX);
+  eR = constrain(r, EYE_MIN, EYE_MAX);
+  writeEyes();
+}
+void snapLids(float p) {
+  lL = lR = constrain(p, 0, 100);
+  writeLids();
+}
+void snapHead(float ud, float t) {
+  tUD = hUD = constrain(ud, UD_UP, UD_DOWN);
+  tT  = hT  = constrain(t, T_LEFT, T_RIGHT);
+  writeHead();
+}
+
+// Waits, but returns false early if a Serial command arrives
+bool hold(unsigned long ms) {
+  unsigned long start = millis();
+  while (millis() - start < ms) {
+    if (Serial.available()) return false;
+    delay(5);
+  }
+  return true;
+}
+
+// Jerky, mechanical movement: small steps with pauses (animatronic feel)
+void stiffTo(float target, float stepDeg, int moveMs, int pauseMs) {
+  target = constrain(target, EYE_MIN, EYE_MAX);
+  while (true) {
+    float d = target - eL;
+    if (d < 0.01f && d > -0.01f) break;
+    float next = (d > 0) ? eL + stepDeg : eL - stepDeg;
+    if ((d > 0 && next > target) || (d < 0 && next < target)) next = target;
+    eyesTo(next, moveMs, EASE_OUT);
+    delay(pauseMs);
+  }
+}
+
+void scheduleBlink() { nextBlinkAt = millis() + random(2000, 6000); }
+
+// ---------------- BASIC EXPRESSIONS ----------------
+
+void blink() {
+  lidsTo(LID_CLOSED, BLINK_CLOSE_MS, EASE_IN);
+  delay(BLINK_HOLD_MS);
+  lidsTo(LID_REST, BLINK_OPEN_MS, EASE_OUT);
+}
+
+void doubleBlink() {
+  blink();
+  delay(110);
+  blink();
+}
+
+void winkLeft() {
+  animate(eL, eR, LID_CLOSED, lR, 200, EASE_IN);
+  delay(450);
+  animate(eL, eR, LID_REST, lR, 250, EASE_OUT);
+}
+
+void winkRight() {
+  animate(eL, eR, lL, LID_CLOSED, 200, EASE_IN);
+  delay(450);
+  animate(eL, eR, lL, LID_REST, 250, EASE_OUT);
+}
+
+// Curious: glances around the room (eyes only)
+void lookAround() {
+  eyesTo(EYE_MAX - 8, 90, EASE_OUT);
+  delay(600);
+  eyesTo(EYE_MIN + 8, 140, EASE_INOUT);
+  delay(500);
+  eyesTo(EYE_MAX - 20, 80, EASE_OUT);
+  delay(300);
+  eyesTo(EYE_CENTER, 200, EASE_INOUT);
+}
+
+// Drifts off to sleep, half-wakes, drifts again, then jolts awake
+void sleepy() {
+  animate(EYE_CENTER, EYE_CENTER, lL, lR, 300, EASE_INOUT);
+  head(UD_DOWN - 5, T_CENTER);          // head droops with the lids
+  lidsTo(85, 2200, EASE_INOUT);
+  delay(500);
+  head(UD_CENTER, T_CENTER);            // half-wakes
+  lidsTo(40, 500, EASE_OUT);
+  delay(250);
+  head(UD_DOWN - 3, T_CENTER);          // drifts again
+  lidsTo(92, 900, EASE_IN);
+  delay(500);
+  head(UD_CENTER - 6, T_CENTER);        // jolt awake
+  lidsTo(LID_WIDE, 120, EASE_OUT);
+  delay(300);
+  goHome(500);
+  doubleBlink();
+}
+
+void surprised() {
+  snapLids(LID_WIDE);
+  head(UD_UP + 3, T_CENTER);            // head rears back
+  eyesTo(EYE_MIN + 5, 60, EASE_OUT);
+  delay(250);
+  eyesTo(EYE_MAX - 5, 100, EASE_INOUT);
+  delay(250);
+  eyesTo(EYE_CENTER, 120, EASE_OUT);
+  delay(400);
+  goHome(500);
+  blink();
+}
+
+void crossEyes() {
+  animate(EYE_CENTER + 15 * CROSS_DIR, EYE_CENTER - 15 * CROSS_DIR, lL, lR, 600, EASE_INOUT);
+  delay(1200);
+  animate(EYE_CENTER, EYE_CENTER, lL, lR, 600, EASE_INOUT);
+}
+
+void scan() {
+  eyesTo(EYE_MAX, 1200, EASE_INOUT);
+  eyesTo(EYE_MIN, 2200, EASE_INOUT);
+  eyesTo(EYE_CENTER, 1000, EASE_INOUT);
+}
+
+void shakeNo() {
+  for (int i = 0; i < 3; i++) {
+    eyesTo(EYE_CENTER + 15, 160, EASE_INOUT);
+    eyesTo(EYE_CENTER - 15, 160, EASE_INOUT);
+  }
+  eyesTo(EYE_CENTER, 160, EASE_INOUT);
+}
+
+void suspicious() {
+  head(UD_CENTER, headFromEye(EYE_MAX - 5));
+  eyesTo(EYE_MAX - 5, 350, EASE_INOUT);
+  lidsTo(55, 500, EASE_INOUT);
+  delay(1500);
+  head(UD_CENTER, T_CENTER);
+  lidsTo(LID_REST, 500, EASE_INOUT);
+  eyesTo(EYE_CENTER, 500, EASE_INOUT);
+}
+
+// One lid squinted, one wide, eyes to the side
+void skeptical() {
+  animate(EYE_MAX - 8, EYE_MAX - 8, 45, LID_WIDE, 450, EASE_INOUT);
+  delay(1400);
+  animate(EYE_CENTER, EYE_CENTER, LID_REST, LID_REST, 500, EASE_INOUT);
+}
+
+// Lids drop fast, fixed glare with a tiny tremor, head tilts down
+void angry() {
+  head(UD_CENTER + 6, T_CENTER);
+  both(EYE_CENTER, 42, 180, EASE_OUT);
+  for (int i = 0; i < 8; i++) {
+    eyesTo(EYE_CENTER + ((i % 2) ? 1.5f : -1.5f), 60, EASE_LINEAR);
+    delay(120);
+  }
+  eyesTo(EYE_CENTER, 100, EASE_OUT);
+  delay(500);
+  head(UD_CENTER, T_CENTER);
+  lidsTo(LID_REST, 600, EASE_INOUT);
+}
+
+// ---------------- COMPANION (HEAD) ANIMATIONS ----------------
+
+// Looks left, then right (eyes lead, head follows), then back
+void lookAroundHead() {
+  lookTo(EYE_MAX - 8, 90, 700, -2);
+  delay(800);
+  lookTo(EYE_MIN + 8, 140, 1100, 0);
+  delay(800);
+  goHome(700);
+}
+
+// "yes" nod
+void nodYes() {
+  for (int i = 0; i < 3; i++) {
+    headMove(106, T_CENTER, 280);
+    headMove(86, T_CENTER, 280);
+  }
+  goHome(350);
+}
+
+// "no" head shake
+void headShakeNo() {
+  for (int i = 0; i < 3; i++) {
+    headMove(UD_CENTER, T_CENTER - 15, 260);
+    headMove(UD_CENTER, T_CENTER + 15, 260);
+  }
+  goHome(350);
+}
+
+// Curious: slowly lifts the head with wide eyes, holds, quick dip
+void curious() {
+  head(78, T_CENTER);
+  animate(eL, eR, LID_WIDE, LID_WIDE, 1200, EASE_INOUT);
+  delay(900);
+  headMove(100, T_CENTER, 220);
+  delay(150);
+  headMove(80, T_CENTER, 300);
+  delay(600);
+  goHome(700);
+}
+
+// Excited: fast bounces with wide eyes
+void excited() {
+  snapLids(LID_WIDE);
+  for (int i = 0; i < 6; i++) {
+    headMove(80, T_CENTER, 130);
+    headMove(103, T_CENTER, 130);
+  }
+  goHome(300);
+}
+
+// Stretch: reaches up high, squints while dropping down, relaxes
+void stretch() {
+  head(UD_UP, T_CENTER);
+  animate(eL, eR, LID_WIDE, LID_WIDE, 1500, EASE_INOUT);
+  delay(1000);
+  head(UD_DOWN - 4, T_CENTER);
+  animate(eL, eR, 40, 40, 500, EASE_INOUT);
+  delay(300);
+  goHome(700);
+}
+
+// Shy: peeks up, ducks down with half-closed lids, peeks again
+void shy() {
+  head(86, T_CENTER);
+  animate(eL, eR, LID_WIDE, LID_WIDE, 600, EASE_INOUT);
+  delay(300);
+  head(UD_DOWN, T_CENTER);
+  animate(eL, eR, 55, 55, 250, EASE_OUT);
+  delay(900);
+  head(84, T_CENTER);
+  animate(eL, eR, LID_WIDE, LID_WIDE, 800, EASE_INOUT);
+  delay(500);
+  goHome(600);
+}
+
+// Double take: looks away, snaps back, looks again
+void doubleTake() {
+  float side = random(2) ? EYE_MAX - 5 : EYE_MIN + 5;
+  lookTo(side, 120, 500, 0);
+  delay(300);
+  head(UD_CENTER, T_CENTER);
+  animate(EYE_CENTER, EYE_CENTER, lL, lR, 180, EASE_OUT);
+  delay(250);
+  lookTo(side, 80, 220, 0);
+  delay(700);
+  goHome(600);
+}
+
+// Heard something: quick turn to one side, holds, adjusts a little
+void heardSomething() {
+  float side = random(2) ? EYE_MAX - 3 : EYE_MIN + 3;
+  lookTo(side, 80, 220, -3);
+  delay(1500);
+  float adj = (side > EYE_CENTER) ? side - 8 : side + 8;
+  lookTo(adj, 150, 400, 0);
+  delay(900);
+  goHome(800);
+}
+
+// Radar sweep: eyes and head scan from one side to the other
+void scanHead() {
+  head(UD_CENTER, headFromEye(EYE_MIN));
+  animate(EYE_MIN, EYE_MIN, lL, lR, 800, EASE_INOUT);
+  delay(300);
+  head(UD_CENTER, headFromEye(EYE_MAX));
+  animate(EYE_MAX, EYE_MAX, lL, lR, 3000, EASE_INOUT);
+  delay(300);
+  goHome(900);
+}
+
+// Bored: drifts to one side with heavy lids, sighs (head droops), recovers
+void bored() {
+  float side = random(2) ? EYE_MAX - 15 : EYE_MIN + 15;
+  head(UD_CENTER + 5, headFromEye(side));
+  animate(side, side, 35, 35, 2500, EASE_INOUT);
+  delay(1200);
+  headMove(UD_CENTER + 10, headFromEye(side), 1800);
+  delay(600);
+  goHome(900);
+}
+
+// Picks a random head animation (used by idle mode)
+void companionTrick() {
+  switch (random(0, 8)) {
+    case 0: nodYes();         break;
+    case 1: curious();        break;
+    case 2: shy();            break;
+    case 3: doubleTake();     break;
+    case 4: heardSomething(); break;
+    case 5: stretch();        break;
+    case 6: bored();          break;
+    case 7: excited();        break;
+  }
+}
+
+// forward declarations (these are defined further down in the file)
+void glitch();
+void powerDown();
+
+// ---------------- EXTRA ANIMATIONS (NEW) ----------------
+
+// Dizzy: eyes spin out of sync, head wobbles, then it recovers
+void dizzy() {
+  for (int i = 0; i < 8; i++) {
+    float a = (i % 2) ? EYE_MAX - 5 : EYE_MIN + 5;
+    head(UD_CENTER + ((i % 2) ? 4 : -4), T_CENTER + ((i % 2) ? 10 : -10));
+    animate(a, EYE_MAX + EYE_MIN - a, 55, 55, 260, EASE_INOUT);   // eyes go opposite ways
+  }
+  for (int i = 0; i < 3; i++) {                                    // wobble slows down
+    float a = (i % 2) ? EYE_CENTER + 10 : EYE_CENTER - 10;
+    head(UD_CENTER + 2, T_CENTER + ((i % 2) ? 5 : -5));
+    animate(a, a, 40, 40, 450, EASE_INOUT);
+  }
+  goHome(600);
+  blink();
+  doubleBlink();
+}
+
+// Sneeze: "ahh... ahhh... CHOO!" then looks around embarrassed
+void sneeze() {
+  head(UD_UP + 3, T_CENTER);
+  animate(EYE_CENTER, EYE_CENTER, 45, 45, 900, EASE_INOUT);   // ahh...
+  delay(250);
+  head(UD_UP, T_CENTER);
+  animate(EYE_CENTER, EYE_CENTER, 20, 20, 500, EASE_OUT);     // ahhh...
+  delay(350);
+  snapHead(UD_DOWN - 2, T_CENTER);                            // CHOO!
+  snapLids(LID_CLOSED);
+  delay(400);
+  headMove(UD_CENTER + 6, T_CENTER, 500);
+  delay(300);
+  lidsTo(LID_REST, 500, EASE_OUT);
+  lookTo(EYE_MIN + 8, 200, 500, 0);                           // "did anyone see that?"
+  delay(500);
+  goHome(600);
+  blink();
+}
+
+// Yawn: head tilts back, eyes squeeze shut, then it drops and blinks awake
+void yawn() {
+  head(UD_UP, T_CENTER);
+  animate(EYE_CENTER, EYE_CENTER, LID_CLOSED, LID_CLOSED, 2200, EASE_INOUT);
+  delay(900);
+  head(UD_CENTER + 6, T_CENTER);
+  animate(EYE_CENTER, EYE_CENTER, LID_CLOSED, LID_CLOSED, 500, EASE_OUT);   // head drops, eyes still shut
+  delay(300);
+  lidsTo(LID_WIDE, 400, EASE_OUT);
+  delay(300);
+  goHome(700);
+  doubleBlink();
+}
+
+// Scared: ducks, darting eyes, trembles, peeks out carefully
+void scared() {
+  snapLids(LID_WIDE);
+  snapHead(UD_DOWN - 2, T_CENTER);
+  for (int i = 0; i < 6; i++) {                               // darting eyes
+    float a = random(EYE_MIN + 3, EYE_MAX - 2);
+    eyesTo(a, 70, EASE_OUT);
+    delay(random(80, 220));
+  }
+  for (int i = 0; i < 14; i++) {                              // trembling
+    snapHead(UD_DOWN - 2 + ((i % 2) ? 2 : -2), T_CENTER + ((i % 2) ? 2 : -2));
+    delay(45);
+  }
+  lidsTo(55, 400, EASE_INOUT);
+  delay(600);
+  lookTo(EYE_MAX - 8, 120, 300, 5);                           // peeks out
+  delay(500);
+  goHome(900);
+  doubleBlink();
+}
+
+// Peek-a-boo: hides head down with shut eyes, pops up from the side
+void peekaboo() {
+  for (int i = 0; i < 2; i++) {
+    float side = i ? T_CENTER + 12 : T_CENTER - 12;
+    head(UD_DOWN, side);
+    animate(EYE_CENTER, EYE_CENTER, LID_CLOSED, LID_CLOSED, 500, EASE_INOUT);   // hides
+    delay(random(600, 1200));
+    head(UD_UP + 5, side);
+    animate(EYE_CENTER, EYE_CENTER, LID_WIDE, LID_WIDE, 120, EASE_OUT);          // BOO!
+    delay(700);
+  }
+  goHome(600);
+  blink();
+}
+
+// Tennis match: follows the ball left-right, faster and faster
+void tennis() {
+  int ms = 700;
+  for (int i = 0; i < 6; i++) {
+    float a = (i % 2) ? EYE_MIN + 5 : EYE_MAX - 5;
+    head(UD_CENTER, headFromEye(a));
+    animate(a, a, LID_WIDE, LID_WIDE, ms, EASE_INOUT);
+    ms = max(260, ms - 90);
+  }
+  goHome(500);
+  delay(300);
+  blink();
+}
+
+// Eye roll: eyes sweep across while the head lifts, then a sigh
+void eyeRoll() {
+  animate(EYE_MIN + 6, EYE_MIN + 6, 45, 45, 400, EASE_INOUT);
+  delay(200);
+  head(UD_UP + 4, T_CENTER);
+  animate(EYE_MAX - 6, EYE_MAX - 6, 45, 45, 1100, EASE_INOUT);
+  delay(150);
+  head(UD_CENTER + 6, T_CENTER);                              // the sigh
+  animate(EYE_CENTER, EYE_CENTER, 35, 35, 600, EASE_INOUT);
+  delay(700);
+  goHome(500);
+  blink();
+}
+
+// Dreamy: slow head sway, wide soft eyes, slow happy blinks
+void dreamy() {
+  lidsTo(LID_WIDE, 700, EASE_INOUT);
+  for (int i = 0; i < 3; i++) {
+    float side = (i % 2) ? T_CENTER + 10 : T_CENTER - 10;
+    head(UD_UP + 8, side);
+    animate(EYE_CENTER, EYE_CENTER, 15, 15, 1500, EASE_INOUT);
+    lidsTo(LID_CLOSED, 500, EASE_INOUT);                      // slow blink
+    delay(150);
+    lidsTo(15, 600, EASE_OUT);
+  }
+  goHome(900);
+  blink();
+}
+
+// Evil laugh: dark glare, then the head bounces "mwa-ha-ha"
+void evilLaugh() {
+  head(UD_DOWN - 4, T_CENTER);
+  animate(EYE_CENTER, EYE_CENTER, 40, 40, 700, EASE_INOUT);
+  delay(500);
+  for (int i = 0; i < 10; i++) {
+    head((i % 2) ? UD_UP + 8 : UD_DOWN - 6, T_CENTER);
+    animate(EYE_CENTER, EYE_CENTER, 30, 30, 110, EASE_INOUT);
+    delay(60);
+  }
+  headMove(UD_CENTER + 3, T_CENTER, 400);
+  delay(700);
+  goHome(700);
+}
+
+// Boot-up: lids stutter open, then a full "system check" of every servo
+void bootUp() {
+  snapHead(UD_CENTER, T_CENTER);
+  snapLids(LID_CLOSED);
+  delay(600);
+  for (int i = 0; i < 4; i++) {                               // lids stutter open
+    lidsTo(100 - 22 * (i + 1), 90, EASE_OUT);
+    delay(random(100, 250));
+  }
+  stiffTo(EYE_MIN, 5, 60, 70);                                // eyes calibration
+  stiffTo(EYE_MAX, 5, 60, 70);
+  stiffTo(EYE_CENTER, 5, 60, 70);
+  headMove(UD_UP, T_CENTER, 500);                             // head calibration
+  headMove(UD_DOWN, T_CENTER, 700);
+  headMove(UD_CENTER, T_LEFT + 10, 500);
+  headMove(UD_CENTER, T_RIGHT - 10, 800);
+  goHome(500);
+  glitch();
+  doubleBlink();
+}
+
+// Picks a random one of the new animations (used by idle mode)
+void funTrick() {
+  switch (random(0, 10)) {
+    case 0: dizzy();     break;
+    case 1: sneeze();    break;
+    case 2: yawn();      break;
+    case 3: scared();    break;
+    case 4: peekaboo();  break;
+    case 5: tennis();    break;
+    case 6: eyeRoll();   break;
+    case 7: dreamy();    break;
+    case 8: evilLaugh(); break;
+    case 9: bootUp();    break;
+  }
+}
+
+// ---------------- COMBO ANIMATIONS (EYES + LIDS + HEAD TOGETHER) ----------------
+
+// Spy: sneaks a look to one side, freezes, checks the other side, relaxes
+void spyMode() {
+  float first  = random(2) ? EYE_MAX - 3 : EYE_MIN + 3;
+  float second = EYE_MAX + EYE_MIN - first;                      // the opposite side
+  head(UD_CENTER + 5, T_CENTER);
+  animate(EYE_CENTER, EYE_CENTER, 45, 45, 600, EASE_INOUT);      // narrows eyes, head lowers
+  delay(400);
+  lookTo(first, 250, 1100, 5);                                   // eyes slide over, head follows slowly
+  delay(1200);                                                   // freezes, listening
+  head(UD_CENTER + 5, T_CENTER);
+  animate(EYE_CENTER, EYE_CENTER, 45, 45, 150, EASE_OUT);        // snaps back to center
+  delay(300);
+  lookTo(second, 120, 700, 5);                                   // quick check of the other side
+  delay(700);
+  goHome(900);
+  doubleBlink();
+}
+
+// Target lock (Terminator style): scans, locks on, focus ticks, flash wide
+void targetLock() {
+  lidsTo(25, 300, EASE_INOUT);
+  head(UD_CENTER, headFromEye(EYE_MIN));
+  animate(EYE_MIN, EYE_MIN, 25, 25, 700, EASE_INOUT);            // scan left
+  delay(250);
+  head(UD_CENTER, headFromEye(EYE_MAX));
+  animate(EYE_MAX, EYE_MAX, 25, 25, 1600, EASE_INOUT);           // scan right
+  delay(250);
+  head(UD_CENTER, T_CENTER);
+  animate(EYE_CENTER, EYE_CENTER, 25, 25, 350, EASE_OUT);        // TARGET FOUND
+  delay(300);
+  for (int i = 0; i < 3; i++) {                                  // lids narrow in steps
+    lidsTo(35 + 10 * i, 80, EASE_OUT);
+    delay(260);
+  }
+  for (int i = 0; i < 8; i++) {                                  // focus tremor
+    eyesTo(EYE_CENTER + ((i % 2) ? 1.5f : -1.5f), 50, EASE_LINEAR);
+    delay(80);
+  }
+  head(UD_CENTER + 5, T_CENTER);
+  both(EYE_CENTER, LID_WIDE, 90, EASE_OUT);                      // flash wide
+  delay(900);
+  goHome(800);
+}
+
+// Full wake-up routine: asleep, stirs, wakes, yawns, shakes it off, looks around
+void wakeUpRoutine() {
+  snapHead(UD_DOWN, T_CENTER + 6);
+  snapLids(LID_CLOSED);
+  delay(1200);
+  for (int i = 0; i < 2; i++) {                                  // stirs a little
+    head(UD_DOWN - 4, T_CENTER - 4);
+    animate(EYE_CENTER, EYE_CENTER, 85, 85, 500, EASE_INOUT);
+    delay(300);
+    head(UD_DOWN, T_CENTER + 6);
+    animate(EYE_CENTER, EYE_CENTER, LID_CLOSED, LID_CLOSED, 600, EASE_INOUT);
+    delay(500);
+  }
+  head(UD_CENTER, T_CENTER);
+  animate(EYE_CENTER, EYE_CENTER, 60, 60, 1200, EASE_INOUT);     // slowly wakes up
+  delay(500);
+  yawn();
+  headShakeNo();                                                 // shakes it off
+  lookAroundHead();                                              // "where am I?"
+  doubleBlink();
+}
+
+// Chases an invisible fly, swats at it, loses it, looks around confused
+void chaseFly() {
+  for (int i = 0; i < 6; i++) {
+    float a = random(EYE_MIN + 3, EYE_MAX - 2);
+    head(UD_CENTER + random(-12, 6), headFromEye(a));
+    animate(a, a, LID_WIDE, LID_WIDE, random(120, 260), EASE_OUT);
+    delay(random(60, 200));
+  }
+  head(UD_UP, T_CENTER);
+  animate(EYE_CENTER, EYE_CENTER, LID_WIDE, LID_WIDE, 900, EASE_INOUT);   // fly goes up...
+  delay(300);
+  headMove(UD_DOWN - 4, T_CENTER, 140);                          // SWAT!
+  delay(500);
+  lookTo(EYE_MIN + 5, 100, 300, 0);                              // where did it go?
+  delay(400);
+  lookTo(EYE_MAX - 5, 100, 300, 0);
+  delay(500);
+  goHome(600);
+  blink();
+}
+
+// Showing off: chin up, slow pose left and right, wink, nod
+void showOff() {
+  head(UD_UP + 6, T_CENTER);
+  animate(EYE_CENTER, EYE_CENTER, 25, 25, 900, EASE_INOUT);      // chin up, smug half-lids
+  delay(500);
+  head(UD_UP + 6, T_LEFT + 8);
+  animate(EYE_MIN + 8, EYE_MIN + 8, 25, 25, 1100, EASE_INOUT);
+  delay(500);
+  head(UD_UP + 6, T_RIGHT - 8);
+  animate(EYE_MAX - 8, EYE_MAX - 8, 25, 25, 1500, EASE_INOUT);
+  delay(400);
+  head(UD_UP + 6, T_CENTER);
+  animate(EYE_CENTER, EYE_CENTER, 25, 25, 700, EASE_INOUT);
+  winkLeft();                                                    // wink
+  nodYes();                                                      // "yeah, I know"
+}
+
+// Thinking: looks up and away, squints one eye, "hmm", then "AHA!"
+void thinking() {
+  head(UD_UP + 3, T_CENTER + 12);
+  animate(EYE_MAX - 8, EYE_MAX - 8, 40, 40, 700, EASE_INOUT);    // up and to the side
+  delay(900);
+  animate(EYE_MAX - 8, EYE_MAX - 8, 55, LID_WIDE, 400, EASE_INOUT);   // one-eye squint
+  delay(700);
+  head(UD_UP + 3, T_CENTER - 8);
+  animate(EYE_MIN + 8, EYE_MIN + 8, 55, LID_WIDE, 900, EASE_INOUT);   // "hmm..." other way
+  delay(700);
+  head(UD_CENTER, T_CENTER);
+  animate(EYE_CENTER, EYE_CENTER, LID_WIDE, LID_WIDE, 120, EASE_OUT); // AHA!
+  delay(300);
+  nodYes();
+}
+
+// Sees something nobody else sees: notices, looks away, slowly looks back, freaks out
+void seesGhost() {
+  float side = random(2) ? EYE_MAX - 5 : EYE_MIN + 5;
+  lookTo(side, 150, 500, -3);
+  delay(500);
+  head(UD_CENTER, T_CENTER);
+  animate(EYE_CENTER, EYE_CENTER, lL, lR, 250, EASE_OUT);        // looks away, "nothing here"
+  delay(1200);
+  head(UD_CENTER, headFromEye(side));
+  animate(side, side, 40, 40, 2500, EASE_INOUT);                 // slowly looks back...
+  delay(400);
+  head(UD_UP + 3, headFromEye(side));
+  animate(side, side, LID_WIDE, LID_WIDE, 90, EASE_OUT);         // it's STILL there!
+  delay(600);
+  for (int i = 0; i < 10; i++) {                                 // trembling
+    snapHead(UD_UP + 3 + ((i % 2) ? 2 : 0), headFromEye(side) + ((i % 2) ? 2 : -2));
+    delay(50);
+  }
+  snapLids(LID_CLOSED);                                          // eyes shut tight
+  delay(900);
+  goHome(800);
+  doubleBlink();
+}
+
+// Dance: head bobs on the beat (120 BPM), eyes and head sway, lids accent
+void dance() {
+  const int beat = 500;
+  lidsTo(LID_REST, 200, EASE_INOUT);
+  for (int b = 0; b < 16; b++) {
+    float ud   = (b % 2) ? UD_CENTER + 8 : UD_CENTER - 6;               // down / up bob
+    float side = ((b / 2) % 2) ? 1 : -1;                                // sway every 2 beats
+    float turn = T_CENTER + 14 * side;
+    float eye  = (side > 0) ? EYE_MAX - 8 : EYE_MIN + 8;
+    head(ud, turn);
+    animate(eye, eye, LID_REST, LID_REST, beat - 120, EASE_INOUT);
+    if (b % 4 == 3) {                                                   // accent blink on beat 4
+      lidsTo(LID_CLOSED, 60, EASE_IN);
+      lidsTo(LID_REST, 60, EASE_OUT);
+    } else {
+      delay(120);
+    }
+  }
+  goHome(500);
+  doubleBlink();
+}
+
+// Hypnosis: eyes and head sweep in opposite directions, then a hard locked stare
+void hypnotize() {
+  lidsTo(LID_WIDE, 500, EASE_INOUT);
+  unsigned long t0 = millis();
+  while (millis() - t0 < 6000) {
+    float phase = 2.0f * PI * (millis() - t0) / 2200.0f;
+    eL = constrain(EYE_CENTER + 22 * sin(phase), EYE_MIN, EYE_MAX);
+    eR = eL;
+    hT  = constrain(T_CENTER - 14 * sin(phase), T_LEFT, T_RIGHT);        // head against the eyes
+    hUD = constrain(UD_CENTER + 5 * sin(phase * 2.0f), UD_UP, UD_DOWN);
+    tT = hT;
+    tUD = hUD;
+    writeEyes();
+    writeHead();
+    delay(10);
+  }
+  head(UD_CENTER, T_CENTER);
+  both(EYE_CENTER, LID_WIDE, 400, EASE_OUT);
+  delay(1500);                                                           // locked stare
+  lidsTo(LID_REST, 500, EASE_INOUT);
+  blink();
+}
+
+// System crash: glitches, power dies, then a full reboot
+void crashReboot() {
+  glitch();
+  delay(150);
+  glitch();
+  powerDown();
+  delay(2000);
+  bootUp();
+}
+
+// Sad: head sinks, lids droop, sad glance, long slow blink, sniffle
+void sad() {
+  head(UD_DOWN - 2, T_CENTER);
+  animate(EYE_CENTER, EYE_CENTER, 50, 50, 2200, EASE_INOUT);     // sinks and droops
+  delay(900);
+  head(UD_DOWN - 2, T_CENTER - 8);
+  animate(EYE_MIN + 12, EYE_MIN + 12, 50, 50, 1200, EASE_INOUT); // sad glance to the side
+  delay(900);
+  lidsTo(LID_CLOSED, 900, EASE_INOUT);                           // long slow blink
+  delay(500);
+  lidsTo(50, 900, EASE_INOUT);
+  delay(500);
+  headMove(UD_DOWN - 5, T_CENTER, 300);                          // small sniffle
+  headMove(UD_DOWN - 1, T_CENTER, 300);
+  delay(700);
+  goHome(1500);
+  blink();
+}
+
+// Picks a random combo animation (used by idle mode)
+void comboTrick() {
+  switch (random(0, 11)) {
+    case 0:  spyMode();        break;
+    case 1:  targetLock();     break;
+    case 2:  wakeUpRoutine();  break;
+    case 3:  chaseFly();       break;
+    case 4:  showOff();        break;
+    case 5:  thinking();       break;
+    case 6:  seesGhost();      break;
+    case 7:  dance();          break;
+    case 8:  hypnotize();      break;
+    case 9:  crashReboot();    break;
+    case 10: sad();            break;
+  }
+}
+
+// ---------------- CALIBRATION HELPERS ----------------
+
+// Closes slowly and holds so you can check that BOTH lids shut completely
+void lidTest() {
+  Serial.println("lid test: closing...");
+  lidsTo(LID_CLOSED, 1500, EASE_INOUT);
+  delay(2000);
+  Serial.println("lid test: opening...");
+  lidsTo(LID_WIDE, 1500, EASE_INOUT);
+  delay(1000);
+  lidsTo(LID_REST, 500, EASE_INOUT);
+}
+
+void showLidCal() {
+  Serial.print("left closed = ");
+  Serial.print(lidLClosed);
+  Serial.print(" | right closed = ");
+  Serial.println(lidRClosed);
+  lidsTo(LID_CLOSED, 500, EASE_INOUT);
+  delay(1200);
+  lidsTo(LID_REST, 500, EASE_INOUT);
+}
+
+// ---------------- FREDDY / FNAF STYLE ----------------
+
+// Locked on you, heavy lids, no blinking (interrupted by Serial input)
+void stare(unsigned long ms) {
+  head(UD_CENTER, T_CENTER);
+  both(EYE_CENTER, LID_REST, 300, EASE_INOUT);
+  hold(ms);
+}
+
+// Slow, heavy blink
+void heavyBlink() {
+  lidsTo(LID_CLOSED, 450, EASE_INOUT);
+  delay(300);
+  lidsTo(LID_REST, 500, EASE_INOUT);
+}
+
+// Half-lidded, stiff slow turn, freeze, then SNAP back to you
+void creepyTurn() {
+  head(UD_CENTER + 4, headFromEye(EYE_MIN + 3));   // head turns with the lids
+  lidsTo(35, 600, EASE_INOUT);
+  stiffTo(EYE_MIN + 3, 3, 70, 90);
+  delay(1800);
+  head(UD_CENTER, T_CENTER);
+  both(EYE_CENTER, LID_WIDE, 70, EASE_OUT);   // snap
+  delay(1500);
+  lidsTo(LID_REST, 600, EASE_INOUT);
+}
+
+// Stalking: head lowers and lids slowly narrow while it stares, then snap wide
+void stalk() {
+  head(UD_CENTER, T_CENTER);
+  both(EYE_CENTER, LID_REST, 300, EASE_INOUT);
+  head(UD_CENTER + 6, T_CENTER);
+  lidsTo(28, 3500, EASE_INOUT);
+  delay(1200);
+  head(UD_CENTER - 2, T_CENTER);
+  lidsTo(LID_WIDE, 90, EASE_OUT);
+  delay(700);
+  head(UD_CENTER, T_CENTER);
+  lidsTo(LID_REST, 500, EASE_INOUT);
+}
+
+// Electrical glitch: random twitching and lid flicker
+void glitch() {
+  int n = random(8, 14);
+  for (int i = 0; i < n; i++) {
+    snapEyes(EYE_CENTER + random(-10, 11), EYE_CENTER + random(-10, 11));
+    snapLids(random(0, 70));
+    delay(random(30, 90));
+  }
+  both(EYE_CENTER, LID_REST, 120, EASE_OUT);
+}
+
+// Faulty servo: one eye jerks on its own
+void twitch() {
+  int n = random(4, 8);
+  for (int i = 0; i < n; i++) {
+    float off = random(4, 9) * (random(2) ? 1 : -1);
+    if (random(2)) snapEyes(EYE_CENTER + off, EYE_CENTER);
+    else           snapEyes(EYE_CENTER, EYE_CENTER + off);
+    delay(random(40, 120));
+    snapEyes(EYE_CENTER, EYE_CENTER);
+    delay(random(150, 700));
+  }
+}
+
+// One eye slowly drifts off, then both correct
+void lazyEye() {
+  both(EYE_CENTER, LID_REST, 300, EASE_INOUT);
+  animate(EYE_CENTER + 18 * LAZY_DIR, EYE_CENTER, lL, lR, 2500, EASE_INOUT);
+  delay(1800);
+  animate(EYE_CENTER, EYE_CENTER, LID_REST, LID_REST, 90, EASE_OUT);
+  delay(800);
+}
+
+// Rapid half-blinks, like a nervous system
+void lidFlutter() {
+  int n = random(6, 10);
+  for (int i = 0; i < n; i++) {
+    lidsTo(random(40, 75), 50, EASE_LINEAR);
+    lidsTo(LID_REST, 50, EASE_LINEAR);
+  }
+  delay(300);
+  blink();
+}
+
+// Wide eyes, head lunges forward, violent shaking that dies down, dead stare
+void jumpscare() {
+  snapLids(LID_WIDE);
+  snapHead(UD_DOWN - 3, T_CENTER);
+  for (int amp = 25; amp >= 3; amp -= 2) {
+    snapEyes(EYE_CENTER + amp, EYE_CENTER + amp);
+    delay(35);
+    snapEyes(EYE_CENTER - amp, EYE_CENTER - amp);
+    delay(35);
+  }
+  both(EYE_CENTER, LID_WIDE, 100, EASE_OUT);
+  delay(1500);
+  head(UD_CENTER, T_CENTER);
+  lidsTo(LID_REST, 900, EASE_INOUT);
+}
+
+// Power runs out: stuttering, lids sag fully shut and stay shut
+void powerDown() {
+  head(UD_DOWN - 6, T_CENTER);   // head sags as the power dies
+  eyesTo(EYE_CENTER, 300, EASE_INOUT);
+  float p = lL;
+  while (p < 100) {
+    p += random(6, 16);
+    if (p > 100) p = 100;
+    lidsTo(p, random(60, 140), EASE_OUT);
+    delay(random(80, 300));
+    if (random(4) == 0 && p < 95) {
+      lidsTo(p - 15, 60, EASE_LINEAR);
+      delay(40);
+      lidsTo(p, 60, EASE_LINEAR);
+    }
+  }
+  lidsTo(LID_CLOSED, 150, EASE_OUT);
+  delay(SETTLE_MS);
+}
+
+// Power comes back: jerky wake-up, glitch, then dead stare
+void powerUp() {
+  head(UD_CENTER, T_CENTER);
+  float p = lL;
+  while (p > LID_REST) {
+    p -= random(10, 28);
+    if (p < LID_REST) p = LID_REST;
+    lidsTo(p, random(50, 120), EASE_OUT);
+    delay(random(60, 220));
+  }
+  glitch();
+  stare(800);
+}
+
+// Camera-like stiff sweep, then locks onto you
+void watchYou() {
+  lidsTo(20, 300, EASE_INOUT);
+  stiffTo(EYE_MAX, 4, 60, 90);
+  delay(700);
+  stiffTo(EYE_MIN, 4, 60, 90);
+  delay(700);
+  stiffTo(EYE_CENTER, 4, 60, 90);
+  lidsTo(LID_REST, 300, EASE_INOUT);
+  delay(1500);
+}
+
+// Freddy idle loop: mostly staring, with rare creepy events
+void freddyStep() {
+  int roll = random(100);
+  if (roll < 30)      stare(random(2500, 6000));
+  else if (roll < 45) heavyBlink();
+  else if (roll < 57) creepyTurn();
+  else if (roll < 67) watchYou();
+  else if (roll < 75) stalk();
+  else if (roll < 83) twitch();
+  else if (roll < 88) lazyEye();
+  else if (roll < 93) lidFlutter();
+  else                glitch();
+
+  // make sure the head is back at center before the next event
+  if (fabs(hUD - UD_CENTER) > 0.5f || fabs(hT - T_CENTER) > 0.5f) goHome(500);
+  hold(random(500, 1500));
+}
+
+// ---------------- NORMAL IDLE (LIFE-LIKE) ----------------
+
+// Waits, blinking on schedule; returns early if a Serial command arrives
+void wait(unsigned long ms) {
+  unsigned long start = millis();
+  while (millis() - start < ms) {
+    if (Serial.available()) return;
+    if (millis() >= nextBlinkAt) {
+      blink();
+      scheduleBlink();
+    }
+    delay(5);
+  }
+}
+
+// Sometimes the head follows the eyes, sometimes it returns to center
+void headFollow(float eyeTarget) {
+  if (random(100) < 45) head(UD_CENTER + random(-4, 5), headFromEye(eyeTarget));
+  else                  head(UD_CENTER, T_CENTER);
+}
+
+void idleStep() {
+  int roll = random(100);
+  float target = random(EYE_MIN + 5, EYE_MAX - 5);
+
+  if (roll < 50)      { headFollow(target); eyesTo(target, random(60, 110), EASE_OUT); }     // quick glance
+  else if (roll < 75) { headFollow(target); eyesTo(target, random(300, 700), EASE_INOUT); }  // slow drift
+  else if (roll < 79) doubleBlink();
+  else if (roll < 83) lookAroundHead();
+  else if (roll < 89) companionTrick();
+  else if (roll < 96) { if (random(2)) funTrick(); else comboTrick(); }
+  else                { head(UD_CENTER, T_CENTER); eyesTo(EYE_CENTER, 400, EASE_INOUT); }
+  wait(random(600, 2600));
+}
+
+// ---------------- SERIAL CONTROL ----------------
+// EYES:  b blink | d double blink | l wink left | r wink right | s sleepy
+//        u surprised | c cross-eyed | x scan | n shake no | q suspicious
+//        e skeptical | a angry | h heavy blink | k creepy turn | y stalk
+//        g glitch | t twitch | m lazy eye | o lid flutter | j jumpscare
+//        p power down | w power up | v watch you | z lid test
+// HEAD:  Y nod yes | N head shake no | L look around | C curious | E excited
+//        X stretch | S shy | D double take | H heard something | R radar scan
+//        B bored | O go home (center everything)
+// FUN:   1 dizzy | 2 sneeze | 3 yawn | 4 scared | 5 peekaboo | 6 tennis
+//        7 eye roll | 8 dreamy | 9 evil laugh | 0 boot up
+// COMBO: A spy | T target lock | W wake-up routine | F chase fly | P show off
+//        Q thinking | G sees ghost | J dance | M hypnotize | K crash+reboot | U sad
+// MODES: f freddy mode | i idle mode
+// Lid calibration: + / - = left closed angle, ] / [ = right closed angle
+
+void handleSerial() {
+  if (!Serial.available()) return;
+  char c = Serial.read();
+  switch (c) {
+    case 'b': blink();        break;
+    case 'd': doubleBlink();  break;
+    case 'l': winkLeft();     break;
+    case 'r': winkRight();    break;
+    case 's': sleepy();       break;
+    case 'u': surprised();    break;
+    case 'c': crossEyes();    break;
+    case 'x': scan();         break;
+    case 'n': shakeNo();      break;
+    case 'q': suspicious();   break;
+    case 'e': skeptical();    break;
+    case 'a': angry();        break;
+    case 'h': heavyBlink();   break;
+    case 'k': creepyTurn();   break;
+    case 'y': stalk();        break;
+    case 'g': glitch();       break;
+    case 't': twitch();       break;
+    case 'm': lazyEye();      break;
+    case 'o': lidFlutter();   break;
+    case 'j': jumpscare();    break;
+    case 'p': powerDown();    break;
+    case 'w': powerUp();      break;
+    case 'v': watchYou();     break;
+    case 'z': lidTest();      break;
+
+    case 'Y': nodYes();         break;
+    case 'N': headShakeNo();    break;
+    case 'L': lookAroundHead(); break;
+    case 'C': curious();        break;
+    case 'E': excited();        break;
+    case 'X': stretch();        break;
+    case 'S': shy();            break;
+    case 'D': doubleTake();     break;
+    case 'H': heardSomething(); break;
+    case 'R': scanHead();       break;
+    case 'B': bored();          break;
+    case 'O': goHome(600);      break;
+
+    case '1': dizzy();          break;
+    case '2': sneeze();         break;
+    case '3': yawn();           break;
+    case '4': scared();         break;
+    case '5': peekaboo();       break;
+    case '6': tennis();         break;
+    case '7': eyeRoll();        break;
+    case '8': dreamy();         break;
+    case '9': evilLaugh();      break;
+    case '0': bootUp();         break;
+
+    case 'A': spyMode();        break;
+    case 'T': targetLock();     break;
+    case 'W': wakeUpRoutine();  break;
+    case 'F': chaseFly();       break;
+    case 'P': showOff();        break;
+    case 'Q': thinking();       break;
+    case 'G': seesGhost();      break;
+    case 'J': dance();          break;
+    case 'M': hypnotize();      break;
+    case 'K': crashReboot();    break;
+    case 'U': sad();            break;
+
+    case '+': lidLClosed = min(180, lidLClosed + 5); showLidCal(); break;
+    case '-': lidLClosed = max(100, lidLClosed - 5); showLidCal(); break;
+    case ']': lidRClosed = max(0, lidRClosed - 5);   showLidCal(); break;
+    case '[': lidRClosed = min(100, lidRClosed + 5); showLidCal(); break;
+
+    case 'f':
+      freddyMode = !freddyMode;
+      Serial.println(freddyMode ? "freddy mode ON" : "freddy mode OFF");
+      break;
+    case 'i':
+      idleMode = !idleMode;
+      Serial.println(idleMode ? "idle ON" : "idle OFF");
+      break;
+  }
+}
+
+// ---------------- SETUP / LOOP ----------------
+
+void setup() {
+  Serial.begin(9600);
+  randomSeed(analogRead(A0));
+
+  leftEye.attach(LEFT_EYE_PIN);
+  rightEye.attach(RIGHT_EYE_PIN);
+  leftLid.attach(LEFT_LID_PIN);
+  rightLid.attach(RIGHT_LID_PIN);
+  headUD.attach(HEAD_UD_PIN);
+  headT.attach(HEAD_T_PIN);
+
+  writeEyes();
+  writeLids();
+  writeHead();
+  delay(800);
+
+  scheduleBlink();
+  Serial.println("Ready");
+  Serial.println("Eyes: b d l r s u c x n q e a h k y g t m o j p w v z");
+  Serial.println("Head: Y N L C E X S D H R B O");
+  Serial.println("Fun: 1 2 3 4 5 6 7 8 9 0");
+  Serial.println("Combo: A T W F P Q G J M K U");
+  Serial.println("Modes: f (freddy) i (idle) | lids: + - ] [");
+}
+
+void loop() {
+  handleSerial();
+  if (freddyMode)    freddyStep();
+  else if (idleMode) idleStep();
+}
