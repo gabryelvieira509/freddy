@@ -1,0 +1,742 @@
+#include <Servo.h>
+
+// =====================================================================
+//  HAUNTED FREDDY - animatronic head
+//  Eyes + lids + head up/down + head turn, all moving together.
+//
+//  It lives through a "night": every FNAF hour (HOUR_MS) it gets more
+//  aggressive. 12 AM = calm and staring ... 5 AM = jumpscare territory.
+//  At 6 AM it powers down, then a new night begins.
+// =====================================================================
+
+// ---------------- PINS ----------------
+const int LEFT_EYE_PIN  = 10;
+const int RIGHT_EYE_PIN = 13;
+const int LEFT_LID_PIN  = 11;
+const int RIGHT_LID_PIN = 12;
+const int HEAD_UD_PIN   = 9;    // head up / down
+const int HEAD_T_PIN    = 8;    // head turn left / right
+
+// ---------------- CALIBRATION: EYES ----------------
+const int EYE_CENTER = 85;
+const int EYE_MIN    = 60;
+const int EYE_MAX    = 110;
+
+const int LID_L_OPEN = 95;
+const int LID_R_OPEN = 110;
+
+// Closed angles - adjustable live over Serial: + / - (left), ] / [ (right)
+int lidLClosed = 170;
+int lidRClosed = 60;
+
+// Lid levels in percent (0 = wide open, 100 = fully closed)
+const float LID_WIDE   = 0;
+const float LID_REST   = 10;    // slightly heavy resting lids (Freddy look)
+const float LID_CLOSED = 100;
+
+// ---------------- CALIBRATION: HEAD ----------------
+// Up/down: bigger = lower. Turn: 60 = max left (robot's point of view)
+const int UD_CENTER = 93;
+const int UD_UP     = 75;
+const int UD_DOWN   = 110;
+
+const int T_CENTER  = 93;
+const int T_LEFT    = 60;
+const int T_RIGHT   = 120;
+
+// If the head turns the OPPOSITE way from where the eyes look, flip to -1
+const int HEAD_FOLLOW_DIR = 1;
+
+// ---------------- THE NIGHT ----------------
+const unsigned long HOUR_MS = 60000UL;   // 1 "FNAF hour" = 60 s  (full night = 6 min)
+
+// Blink / lid tuning
+const int BLINK_CLOSE_MS = 110;
+const int BLINK_HOLD_MS  = 80;
+const int BLINK_OPEN_MS  = 180;
+const int SETTLE_MS      = 150;   // wait after a full close so servos arrive
+
+// If the lazy eye drifts the wrong way, flip to -1
+const int LAZY_DIR = 1;
+
+// ---------------- EASING ----------------
+const byte EASE_LINEAR = 0;
+const byte EASE_IN     = 1;   // starts slow, ends fast
+const byte EASE_OUT    = 2;   // starts fast, ends slow
+const byte EASE_INOUT  = 3;   // smooth both ends
+
+// ---------------- SERVOS / STATE ----------------
+Servo leftEye, rightEye, leftLid, rightLid, headUD, headT;
+
+float eL = EYE_CENTER, eR = EYE_CENTER;   // eye angles (degrees)
+float lL = LID_REST,   lR = LID_REST;     // lid levels (percent)
+float hUD = UD_CENTER, hT = T_CENTER;     // head angles now
+float tUD = UD_CENTER, tT = T_CENTER;     // head targets (used by the next animate)
+
+bool autoHaunt = true;            // the night plays by itself
+int  forcedLevel = -1;            // -1 = follow the night clock, 0..5 = fixed level
+unsigned long nightStart = 0;
+int lastHour = -1;
+
+// ---------------- LOW-LEVEL ----------------
+
+// Same mapping as Servo.write(), but with fractional-degree precision
+int degToUs(float deg) {
+  return 544 + (int)(deg * (2400.0f - 544.0f) / 180.0f + 0.5f);
+}
+
+float lidAngleL(float pct) { return LID_L_OPEN + (lidLClosed - LID_L_OPEN) * pct / 100.0f; }
+float lidAngleR(float pct) { return LID_R_OPEN + (lidRClosed - LID_R_OPEN) * pct / 100.0f; }
+
+void writeEyes() {
+  leftEye.writeMicroseconds(degToUs(eL));
+  rightEye.writeMicroseconds(degToUs(eR));
+}
+
+void writeLids() {
+  leftLid.writeMicroseconds(degToUs(lidAngleL(lL)));
+  rightLid.writeMicroseconds(degToUs(lidAngleR(lR)));
+}
+
+void writeHead() {
+  headUD.writeMicroseconds(degToUs(hUD));
+  headT.writeMicroseconds(degToUs(hT));
+}
+
+float applyEase(float t, byte ease) {
+  switch (ease) {
+    case EASE_IN:    return t * t;
+    case EASE_OUT:   return 1.0f - (1.0f - t) * (1.0f - t);
+    case EASE_INOUT: return t * t * (3.0f - 2.0f * t);
+    default:         return t;
+  }
+}
+
+// Sets where the head should go. It moves during the NEXT animate() call
+// (so head, eyes and lids all travel together on the same timeline).
+void head(float ud, float t) {
+  tUD = constrain(ud, UD_UP, UD_DOWN);
+  tT  = constrain(t, T_LEFT, T_RIGHT);
+}
+
+// Moves eyes, lids AND head at the same time to their targets over `ms`
+void animate(float tel, float ter, float tll, float tlr, int ms, byte ease) {
+  tel = constrain(tel, EYE_MIN, EYE_MAX);
+  ter = constrain(ter, EYE_MIN, EYE_MAX);
+  tll = constrain(tll, 0, 100);
+  tlr = constrain(tlr, 0, 100);
+
+  float sel = eL, ser = eR, sll = lL, slr = lR;
+  float sud = hUD, st = hT;
+  unsigned long t0 = millis();
+
+  while (true) {
+    float t = (ms <= 0) ? 1.0f : (float)(millis() - t0) / (float)ms;
+    if (t > 1.0f) t = 1.0f;
+    float k = applyEase(t, ease);
+
+    eL = sel + (tel - sel) * k;
+    eR = ser + (ter - ser) * k;
+    lL = sll + (tll - sll) * k;
+    lR = slr + (tlr - slr) * k;
+    hUD = sud + (tUD - sud) * k;
+    hT  = st  + (tT  - st)  * k;
+    writeEyes();
+    writeLids();
+    writeHead();
+
+    if (t >= 1.0f) break;
+    delay(8);
+  }
+}
+
+// Convenience wrappers
+void eyesTo(float a, int ms, byte e)           { animate(a, a, lL, lR, ms, e); }
+void lidsTo(float p, int ms, byte e)           { animate(eL, eR, p, p, ms, e); }
+void both(float a, float p, int ms, byte e)    { animate(a, a, p, p, ms, e); }
+
+// Moves only the head (eyes and lids stay where they are)
+void headMove(float ud, float t, int ms) {
+  head(ud, t);
+  animate(eL, eR, lL, lR, ms, EASE_INOUT);
+}
+
+// Everything back to neutral: head centered, eyes centered, resting lids
+void goHome(int ms) {
+  head(UD_CENTER, T_CENTER);
+  animate(EYE_CENTER, EYE_CENTER, LID_REST, LID_REST, ms, EASE_INOUT);
+}
+
+// Maps an eye angle to the matching head-turn angle
+float headFromEye(float eyeAngle) {
+  float a = T_CENTER + HEAD_FOLLOW_DIR * (eyeAngle - EYE_CENTER) * 0.8f;
+  return constrain(a, T_LEFT, T_RIGHT);
+}
+
+// Eyes lead the movement, the head follows a moment later
+void lookTo(float eyeAngle, int eyeMs, int headMs, int udOffset) {
+  eyesTo(eyeAngle, eyeMs, EASE_OUT);
+  delay(60);
+  head(UD_CENTER + udOffset, headFromEye(eyeAngle));
+  animate(eL, eR, lL, lR, headMs, EASE_INOUT);
+}
+
+// Instant jumps (used for glitches and scares)
+void snapEyes(float l, float r) {
+  eL = constrain(l, EYE_MIN, EYE_MAX);
+  eR = constrain(r, EYE_MIN, EYE_MAX);
+  writeEyes();
+}
+void snapLids(float p) {
+  lL = lR = constrain(p, 0, 100);
+  writeLids();
+}
+void snapHead(float ud, float t) {
+  tUD = hUD = constrain(ud, UD_UP, UD_DOWN);
+  tT  = hT  = constrain(t, T_LEFT, T_RIGHT);
+  writeHead();
+}
+
+// Waits, but returns false early if a Serial command arrives
+bool hold(unsigned long ms) {
+  unsigned long start = millis();
+  while (millis() - start < ms) {
+    if (Serial.available()) return false;
+    delay(5);
+  }
+  return true;
+}
+
+// Jerky, mechanical eye movement: small steps with pauses
+void stiffTo(float target, float stepDeg, int moveMs, int pauseMs) {
+  target = constrain(target, EYE_MIN, EYE_MAX);
+  while (true) {
+    float d = target - eL;
+    if (d < 0.01f && d > -0.01f) break;
+    float next = (d > 0) ? eL + stepDeg : eL - stepDeg;
+    if ((d > 0 && next > target) || (d < 0 && next < target)) next = target;
+    eyesTo(next, moveMs, EASE_OUT);
+    delay(pauseMs);
+  }
+}
+
+// ---------------- THE NIGHT CLOCK ----------------
+
+int currentHour() {
+  return (int)((millis() - nightStart) / HOUR_MS);
+}
+
+// Aggression level 0..5 (fixed by Serial 1-5, otherwise follows the clock)
+int level() {
+  if (forcedLevel >= 0) return forcedLevel;
+  return constrain(currentHour(), 0, 5);
+}
+
+// ---------------- BASIC EXPRESSIONS ----------------
+
+void blink() {
+  lidsTo(LID_CLOSED, BLINK_CLOSE_MS, EASE_IN);
+  delay(BLINK_HOLD_MS);
+  lidsTo(LID_REST, BLINK_OPEN_MS, EASE_OUT);
+}
+
+// Slow, heavy blink
+void heavyBlink() {
+  lidsTo(LID_CLOSED, 450, EASE_INOUT);
+  delay(300);
+  lidsTo(LID_REST, 500, EASE_INOUT);
+}
+
+// Locked on you, heavy lids, no blinking, with a faint breathing sway.
+// (interrupted by Serial input)
+void stare(unsigned long ms) {
+  head(UD_CENTER, T_CENTER);
+  both(EYE_CENTER, LID_REST, 300, EASE_INOUT);
+  unsigned long t0 = millis();
+  while (millis() - t0 < ms) {
+    if (Serial.available()) return;
+    float s = sin((millis() - t0) / 900.0f);
+    hUD = UD_CENTER + 1.2f * s;
+    tUD = hUD;
+    writeHead();
+    delay(15);
+  }
+}
+
+// ---------------- CREEPY EVENTS ----------------
+
+// Eyes track an invisible person walking across the room, head lags behind
+void trackYou() {
+  float side  = random(2) ? EYE_MAX - 4 : EYE_MIN + 4;
+  float other = EYE_MAX + EYE_MIN - side;
+  lidsTo(20, 300, EASE_INOUT);
+  animate(side, side, 20, 20, 400, EASE_OUT);              // locks onto someone at the edge
+  delay(400);
+  animate(other, other, 20, 20, 3000, EASE_INOUT);         // eyes follow them across the room
+  head(UD_CENTER, headFromEye(other));
+  animate(other, other, 20, 20, 1500, EASE_INOUT);         // the head finally catches up
+  delay(800);
+  goHome(1200);
+}
+
+// Half-lidded, stiff slow turn, freeze, then SNAP back to you
+void creepyTurn() {
+  head(UD_CENTER + 4, headFromEye(EYE_MIN + 3));           // head turns with the lids
+  lidsTo(35, 600, EASE_INOUT);
+  stiffTo(EYE_MIN + 3, 3, 70, 90);
+  delay(1800);
+  head(UD_CENTER, T_CENTER);
+  both(EYE_CENTER, LID_WIDE, 70, EASE_OUT);                // snap
+  delay(1500);
+  lidsTo(LID_REST, 600, EASE_INOUT);
+}
+
+// Camera-like stiff sweep, then locks onto you
+void watchYou() {
+  lidsTo(20, 300, EASE_INOUT);
+  stiffTo(EYE_MAX, 4, 60, 90);
+  delay(700);
+  stiffTo(EYE_MIN, 4, 60, 90);
+  delay(700);
+  stiffTo(EYE_CENTER, 4, 60, 90);
+  lidsTo(LID_REST, 300, EASE_INOUT);
+  delay(1500);
+}
+
+// Stalking: head lowers and lids slowly narrow while it stares, then snap wide
+void stalk() {
+  head(UD_CENTER, T_CENTER);
+  both(EYE_CENTER, LID_REST, 300, EASE_INOUT);
+  head(UD_CENTER + 6, T_CENTER);
+  lidsTo(28, 3500, EASE_INOUT);
+  delay(1200);
+  head(UD_CENTER - 2, T_CENTER);
+  lidsTo(LID_WIDE, 90, EASE_OUT);
+  delay(700);
+  head(UD_CENTER, T_CENTER);
+  lidsTo(LID_REST, 500, EASE_INOUT);
+}
+
+// "He's at the door": head snaps to one side and stares, then slowly turns back
+void checkDoor() {
+  float side = random(2) ? 1 : -1;
+  float eye = EYE_CENTER + 20 * side;
+  head(UD_CENTER - 2, headFromEye(eye));
+  animate(eye, eye, 30, 30, 160, EASE_OUT);                // snaps toward the door (fast!)
+  delay(random(2000, 3500));                               // stares at it
+  head(UD_CENTER, T_CENTER);
+  animate(EYE_CENTER, EYE_CENTER, LID_REST, LID_REST, 1800, EASE_INOUT);   // slowly back at you
+  delay(500);
+}
+
+// Freddy's giggle: locked stare, narrowed lids, head shaking irregularly
+void laugh() {
+  head(UD_CENTER, T_CENTER);
+  both(EYE_CENTER, 30, 300, EASE_INOUT);
+  delay(400);
+  for (int i = 0; i < 14; i++) {                           // "ha ha ha ha"
+    snapHead(UD_CENTER + ((i % 2) ? 5 : -3), T_CENTER);
+    delay(random(70, 130));
+  }
+  head(UD_CENTER, T_CENTER);
+  both(EYE_CENTER, LID_REST, 500, EASE_INOUT);
+  delay(500);
+}
+
+// Music box: head ticks side to side like a wind-up toy, eyes never leave you
+void musicBox() {
+  const int steps[8] = { -6, -12, -6, 0, 6, 12, 6, 0 };
+  both(EYE_CENTER, 25, 300, EASE_INOUT);
+  for (int i = 0; i < 8; i++) {
+    head(UD_CENTER + ((i % 2) ? 2 : -2), T_CENTER + steps[i]);
+    float eye = EYE_CENTER - HEAD_FOLLOW_DIR * steps[i] * 1.25f;
+    animate(eye, eye, 25, 25, 90, EASE_OUT);
+    delay(260);
+  }
+  goHome(600);
+}
+
+// Possessed: head snaps to random angles, eyes spin out of control, then freezes
+void possessed() {
+  both(EYE_CENTER, 15, 300, EASE_INOUT);
+  for (int i = 0; i < 9; i++) {
+    snapHead(random(UD_UP + 3, UD_DOWN - 2), random(T_LEFT + 5, T_RIGHT - 3));
+    snapEyes(random(EYE_MIN, EYE_MAX + 1), random(EYE_MIN, EYE_MAX + 1));
+    snapLids(random(0, 40));
+    delay(random(60, 260));
+  }
+  snapEyes(EYE_CENTER, EYE_CENTER);
+  head(UD_CENTER, T_CENTER);
+  both(EYE_CENTER, LID_WIDE, 60, EASE_OUT);                // freezes, staring dead at you
+  delay(1800);
+  lidsTo(LID_REST, 700, EASE_INOUT);
+  goHome(500);
+}
+
+// Owl turn: head rotates far to one side, but the eyes counter-rotate and stay on you
+void headSpin() {
+  float side = random(2) ? 1 : -1;
+  both(EYE_CENTER, 20, 300, EASE_INOUT);
+  head(UD_CENTER, T_CENTER + side * 26);
+  float eye = EYE_CENTER - HEAD_FOLLOW_DIR * side * 26 / 0.8f;
+  animate(eye, eye, 20, 20, 3500, EASE_INOUT);
+  delay(1500);                                             // eyes still locked on you
+  head(UD_CENTER, T_CENTER);
+  animate(EYE_CENTER, EYE_CENTER, 20, 20, 2500, EASE_INOUT);
+  delay(400);
+  both(EYE_CENTER, LID_REST, 400, EASE_INOUT);
+}
+
+// Anger build-up: lids drop, head and eyes shudder harder and harder
+void growl() {
+  head(UD_CENTER + 4, T_CENTER);
+  both(EYE_CENTER, 45, 600, EASE_OUT);                     // lids drop, glare
+  for (int i = 0; i < 24; i++) {
+    float amp = 0.8f + i * 0.12f;
+    float s = (i % 2) ? amp : -amp;
+    snapHead(UD_CENTER + 4 + s, T_CENTER + s);
+    snapEyes(EYE_CENTER + s, EYE_CENTER + s);
+    delay(55);
+  }
+  head(UD_CENTER, T_CENTER);
+  both(EYE_CENTER, LID_REST, 700, EASE_INOUT);
+}
+
+// Electrical glitch: random twitching of everything
+void glitch() {
+  int n = random(8, 14);
+  for (int i = 0; i < n; i++) {
+    snapEyes(EYE_CENTER + random(-10, 11), EYE_CENTER + random(-10, 11));
+    snapLids(random(0, 70));
+    snapHead(UD_CENTER + random(-5, 6), T_CENTER + random(-8, 9));
+    delay(random(30, 90));
+  }
+  head(UD_CENTER, T_CENTER);
+  both(EYE_CENTER, LID_REST, 120, EASE_OUT);
+}
+
+// Faulty servo: one eye jerks on its own
+void twitch() {
+  int n = random(4, 8);
+  for (int i = 0; i < n; i++) {
+    float off = random(4, 9) * (random(2) ? 1 : -1);
+    if (random(2)) snapEyes(EYE_CENTER + off, EYE_CENTER);
+    else           snapEyes(EYE_CENTER, EYE_CENTER + off);
+    delay(random(40, 120));
+    snapEyes(EYE_CENTER, EYE_CENTER);
+    delay(random(150, 700));
+  }
+}
+
+// One eye slowly drifts off, then both correct
+void lazyEye() {
+  both(EYE_CENTER, LID_REST, 300, EASE_INOUT);
+  animate(EYE_CENTER + 18 * LAZY_DIR, EYE_CENTER, lL, lR, 2500, EASE_INOUT);
+  delay(1800);
+  animate(EYE_CENTER, EYE_CENTER, LID_REST, LID_REST, 90, EASE_OUT);
+  delay(800);
+}
+
+// Rapid half-blinks, like a nervous system
+void lidFlutter() {
+  int n = random(6, 10);
+  for (int i = 0; i < n; i++) {
+    lidsTo(random(40, 75), 50, EASE_LINEAR);
+    lidsTo(LID_REST, 50, EASE_LINEAR);
+  }
+  delay(300);
+  blink();
+}
+
+// ---------------- POWER / JUMPSCARE ----------------
+
+// Power runs out: stuttering, lids sag fully shut, head sags
+void powerDown() {
+  head(UD_DOWN - 6, T_CENTER);
+  eyesTo(EYE_CENTER, 300, EASE_INOUT);
+  float p = lL;
+  while (p < 100) {
+    p += random(6, 16);
+    if (p > 100) p = 100;
+    lidsTo(p, random(60, 140), EASE_OUT);
+    delay(random(80, 300));
+    if (random(4) == 0 && p < 95) {
+      lidsTo(p - 15, 60, EASE_LINEAR);
+      delay(40);
+      lidsTo(p, 60, EASE_LINEAR);
+    }
+  }
+  lidsTo(LID_CLOSED, 150, EASE_OUT);
+  delay(SETTLE_MS);
+}
+
+// Power comes back: jerky wake-up, glitch, then dead stare
+void powerUp() {
+  head(UD_CENTER, T_CENTER);
+  float p = lL;
+  while (p > LID_REST) {
+    p -= random(10, 28);
+    if (p < LID_REST) p = LID_REST;
+    lidsTo(p, random(50, 120), EASE_OUT);
+    delay(random(60, 220));
+  }
+  glitch();
+  stare(800);
+}
+
+// Head lunges forward, eyes wide, violent shaking that dies down, dead stare
+void screamShake() {
+  snapHead(UD_DOWN - 3, T_CENTER);
+  snapEyes(EYE_CENTER, EYE_CENTER);
+  snapLids(LID_WIDE);
+  for (int amp = 24; amp >= 4; amp -= 2) {
+    snapHead(UD_DOWN - 3, T_CENTER + amp);
+    snapEyes(EYE_CENTER + amp / 2, EYE_CENTER + amp / 2);
+    delay(30);
+    snapHead(UD_DOWN - 3, T_CENTER - amp);
+    snapEyes(EYE_CENTER - amp / 2, EYE_CENTER - amp / 2);
+    delay(30);
+  }
+  head(UD_DOWN - 3, T_CENTER);
+  both(EYE_CENTER, LID_WIDE, 100, EASE_OUT);
+  delay(1800);                                             // dead stare
+}
+
+void jumpscare() {
+  screamShake();
+  head(UD_CENTER, T_CENTER);
+  lidsTo(LID_REST, 900, EASE_INOUT);
+}
+
+// THE classic night sequence: stares at you, power flickers, everything dies,
+// eyes flash in the dark getting closer each time... then the jumpscare
+void freddyPowerOut() {
+  // 1. calm dead stare
+  head(UD_CENTER, T_CENTER);
+  both(EYE_CENTER, LID_REST, 400, EASE_INOUT);
+  delay(1500);
+
+  // 2. the power flickers
+  for (int i = 0; i < 6; i++) {
+    snapLids(random(60, 101));
+    snapEyes(EYE_CENTER + random(-4, 5), EYE_CENTER + random(-4, 5));
+    delay(random(40, 120));
+    snapLids(LID_REST);
+    delay(random(80, 260));
+  }
+
+  // 3. power dies: lids sag shut, head sags
+  powerDown();
+  delay(2500);
+
+  // 4. in the dark: eyes flash on for a split second, closer to you every time
+  for (int i = 0; i < 3; i++) {
+    snapHead(UD_DOWN - 6 - 4 * i, T_CENTER - 14 + 7 * i);
+    snapEyes(EYE_CENTER, EYE_CENTER);
+    snapLids(LID_WIDE);
+    delay(random(70, 130));
+    snapLids(LID_CLOSED);
+    delay(random(900, 1800));
+  }
+
+  // 5. JUMPSCARE
+  screamShake();
+
+  // 6. game over: slowly sinks and goes dark... then power comes back
+  head(UD_DOWN, T_CENTER);
+  animate(EYE_CENTER, EYE_CENTER, LID_CLOSED, LID_CLOSED, 2500, EASE_INOUT);
+  delay(2500);
+  powerUp();
+}
+
+// 6 AM: the night is over. It powers down... but one eye cracks open before it dies.
+void sixAM() {
+  Serial.println("6 AM");
+  head(UD_DOWN - 4, T_CENTER);
+  animate(EYE_CENTER, EYE_CENTER, LID_CLOSED, LID_CLOSED, 3500, EASE_INOUT);
+  hold(5000);                                              // dead
+  animate(EYE_CENTER, EYE_CENTER, 80, LID_CLOSED, 600, EASE_INOUT);        // one eye cracks open
+  hold(900);
+  animate(EYE_CENTER, EYE_CENTER, LID_CLOSED, LID_CLOSED, 900, EASE_INOUT);
+  hold(3000);
+  nightStart = millis();                                   // a new night begins
+  lastHour = -1;
+  powerUp();
+}
+
+// ---------------- THE HAUNTING (AUTOMATIC) ----------------
+
+// Quiet moments: it just watches you
+void calmEvent() {
+  switch (random(0, 4)) {
+    case 0:
+    case 1:  stare(random(2500, 6000)); break;
+    case 2:  heavyBlink();              break;
+    case 3:  trackYou();                break;
+  }
+}
+
+// Scary events unlock as the level goes up
+void scaryEvent(int lvl) {
+  int n = random(0, 6 + lvl * 2);
+  switch (n) {
+    case 0:  creepyTurn(); break;
+    case 1:  watchYou();   break;
+    case 2:  stalk();      break;
+    case 3:  twitch();     break;
+    case 4:  lazyEye();    break;
+    case 5:  lidFlutter(); break;
+    case 6:  checkDoor();  break;
+    case 7:  laugh();      break;
+    case 8:  glitch();     break;
+    case 9:  headSpin();   break;
+    case 10: musicBox();   break;
+    case 11: possessed();  break;
+    case 12: growl();      break;
+    default:
+      if (random(3) == 0) freddyPowerOut();                // rare: the full night sequence
+      else                growl();
+      break;
+  }
+}
+
+void hauntStep() {
+  int lvl = level();
+  int scary = 15 + lvl * 12;                               // 15% at level 0 ... 75% at level 5
+  if (random(100) < scary) scaryEvent(lvl);
+  else                     calmEvent();
+
+  // it gets less patient as the night goes on
+  long pauseMin = max(300, 3200 - lvl * 450);
+  long pauseMax = max(900, 6000 - lvl * 800);
+  hold(random(pauseMin, pauseMax));
+}
+
+// ---------------- CALIBRATION HELPERS ----------------
+
+// Closes slowly and holds so you can check that BOTH lids shut completely
+void lidTest() {
+  Serial.println("lid test: closing...");
+  lidsTo(LID_CLOSED, 1500, EASE_INOUT);
+  delay(2000);
+  Serial.println("lid test: opening...");
+  lidsTo(LID_WIDE, 1500, EASE_INOUT);
+  delay(1000);
+  lidsTo(LID_REST, 500, EASE_INOUT);
+}
+
+void showLidCal() {
+  Serial.print("left closed = ");
+  Serial.print(lidLClosed);
+  Serial.print(" | right closed = ");
+  Serial.println(lidRClosed);
+  lidsTo(LID_CLOSED, 500, EASE_INOUT);
+  delay(1200);
+  lidsTo(LID_REST, 500, EASE_INOUT);
+}
+
+// ---------------- SERIAL CONTROL ----------------
+// b blink | h heavy blink | e track you | k creepy turn | v watch you | y stalk
+// d check door | l laugh | n music box | x possessed | s owl head turn | r growl
+// g glitch | t twitch | m lazy eye | o lid flutter | q stare 4s
+// j jumpscare | p power down | w power up | f full night sequence | u jump to 6 AM
+// i auto haunt on/off | O go home | z lid test
+// 0 = follow night clock | 1..5 = lock the aggression level (5 = jumpscare territory)
+// Lid calibration: + / - = left closed angle, ] / [ = right closed angle
+
+void handleSerial() {
+  if (!Serial.available()) return;
+  char c = Serial.read();
+  switch (c) {
+    case 'b': blink();          break;
+    case 'h': heavyBlink();     break;
+    case 'e': trackYou();       break;
+    case 'k': creepyTurn();     break;
+    case 'v': watchYou();       break;
+    case 'y': stalk();          break;
+    case 'd': checkDoor();      break;
+    case 'l': laugh();          break;
+    case 'n': musicBox();       break;
+    case 'x': possessed();      break;
+    case 's': headSpin();       break;
+    case 'r': growl();          break;
+    case 'g': glitch();         break;
+    case 't': twitch();         break;
+    case 'm': lazyEye();        break;
+    case 'o': lidFlutter();     break;
+    case 'q': stare(4000);      break;
+    case 'j': jumpscare();      break;
+    case 'p': powerDown();      break;
+    case 'w': powerUp();        break;
+    case 'f': freddyPowerOut(); break;
+    case 'u': sixAM();          break;
+    case 'O': goHome(600);      break;
+    case 'z': lidTest();        break;
+
+    case '0':
+      forcedLevel = -1;
+      Serial.println("level: follows the night clock");
+      break;
+    case '1': case '2': case '3': case '4': case '5':
+      forcedLevel = c - '0';                               // key 1..5 = level 1..5
+      Serial.print("level locked at ");
+      Serial.println(forcedLevel);
+      break;
+
+    case '+': lidLClosed = min(180, lidLClosed + 5); showLidCal(); break;
+    case '-': lidLClosed = max(100, lidLClosed - 5); showLidCal(); break;
+    case ']': lidRClosed = max(0, lidRClosed - 5);   showLidCal(); break;
+    case '[': lidRClosed = min(100, lidRClosed + 5); showLidCal(); break;
+
+    case 'i':
+      autoHaunt = !autoHaunt;
+      Serial.println(autoHaunt ? "auto haunt ON" : "auto haunt OFF");
+      break;
+  }
+}
+
+// ---------------- SETUP / LOOP ----------------
+
+void setup() {
+  Serial.begin(9600);
+  randomSeed(analogRead(A0));
+
+  leftEye.attach(LEFT_EYE_PIN);
+  rightEye.attach(RIGHT_EYE_PIN);
+  leftLid.attach(LEFT_LID_PIN);
+  rightLid.attach(RIGHT_LID_PIN);
+  headUD.attach(HEAD_UD_PIN);
+  headT.attach(HEAD_T_PIN);
+
+  // starts "dead": lids shut, head slumped
+  eL = eR = EYE_CENTER;
+  snapLids(LID_CLOSED);
+  snapHead(UD_DOWN - 6, T_CENTER);
+  writeEyes();
+  delay(1500);
+
+  Serial.println("Haunted Freddy online");
+  Serial.println("Eyes:  b h e k v y d l n x s r g t m o q");
+  Serial.println("Scare: j p w f u | i auto | O home | z lid test | 0-5 level");
+  Serial.println("Lids:  + - ] [");
+
+  powerUp();                                               // jerky boot, glitch, stare
+  nightStart = millis();
+}
+
+void loop() {
+  handleSerial();
+  if (!autoHaunt) return;
+
+  int hour = currentHour();
+  if (hour != lastHour) {
+    lastHour = hour;
+    Serial.print(hour == 0 ? 12 : hour);
+    Serial.println(" AM");
+  }
+  if (hour >= 6) {
+    sixAM();
+    return;
+  }
+  hauntStep();
+}
